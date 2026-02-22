@@ -113,6 +113,19 @@ pub struct CmdOverrides {
     pub env: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct AppendPrompt(pub Option<String>);
+
+impl AppendPrompt {
+    pub fn combine_prompt(&self, prompt: &str) -> String {
+        match &self.0 {
+            Some(extra) => format!("{prompt}{extra}"),
+            None => prompt.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandParts {
     pub program: String,
@@ -383,6 +396,7 @@ pub struct CommandExecutorConfig {
     pub profile_id: ExecutorProfileId,
     pub base_command: String,
     pub default_params: Vec<String>,
+    pub append_prompt: AppendPrompt,
     pub cmd_overrides: CmdOverrides,
     pub capabilities: Vec<ExecutorCapability>,
 }
@@ -417,12 +431,13 @@ impl CommandBackedExecutor {
         if let Some(override_env) = &self.config.cmd_overrides.env {
             merged_env.merge(override_env);
         }
+        let combined_prompt = self.config.append_prompt.combine_prompt(prompt);
 
         let parts = self.config.command_builder().build_initial()?;
         let mut cmd = Command::new(parts.program);
         cmd.args(parts.args)
             .current_dir(current_dir)
-            .env("AURA_PROMPT", prompt)
+            .env("AURA_PROMPT", combined_prompt)
             .env(
                 "AURA_COMMIT_REMINDER",
                 merged_env.commit_reminder.to_string(),
@@ -511,16 +526,37 @@ pub mod adapters {
     use aura_contracts::ExecutorKind;
 
     use super::{
-        CmdOverrides, CommandBackedExecutor, CommandExecutorConfig, ExecutorCapability,
-        ExecutorProfileId,
+        AppendPrompt, CmdOverrides, CommandBackedExecutor, CommandExecutorConfig,
+        ExecutorCapability, ExecutorProfileId,
     };
 
-    pub fn codex_default() -> CommandBackedExecutor {
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct CodexOptions {
+        pub append_prompt: AppendPrompt,
+        pub model: Option<String>,
+        pub sandbox: Option<String>,
+        pub ask_for_approval: Option<String>,
+        pub cmd_overrides: CmdOverrides,
+    }
+
+    pub fn codex(options: CodexOptions) -> CommandBackedExecutor {
+        let mut params = vec!["app-server".to_string()];
+        if let Some(model) = options.model {
+            params.extend(["--model".to_string(), model]);
+        }
+        if let Some(sandbox) = options.sandbox {
+            params.extend(["--sandbox".to_string(), sandbox]);
+        }
+        if let Some(policy) = options.ask_for_approval {
+            params.extend(["--ask-for-approval".to_string(), policy]);
+        }
+
         CommandBackedExecutor::new(CommandExecutorConfig {
             profile_id: ExecutorProfileId::new(ExecutorKind::Codex),
-            base_command: "codex".to_string(),
-            default_params: vec![],
-            cmd_overrides: CmdOverrides::default(),
+            base_command: "npx -y @openai/codex@0.86.0".to_string(),
+            default_params: params,
+            append_prompt: options.append_prompt,
+            cmd_overrides: options.cmd_overrides,
             capabilities: vec![
                 ExecutorCapability::SessionFork,
                 ExecutorCapability::SetupHelper,
@@ -528,34 +564,348 @@ pub mod adapters {
         })
     }
 
-    pub fn claude_default() -> CommandBackedExecutor {
+    pub fn codex_default() -> CommandBackedExecutor {
+        codex(CodexOptions::default())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct ClaudeOptions {
+        pub append_prompt: AppendPrompt,
+        pub model: Option<String>,
+        pub plan: bool,
+        pub approvals: bool,
+        pub dangerously_skip_permissions: bool,
+        pub claude_code_router: bool,
+        pub cmd_overrides: CmdOverrides,
+    }
+
+    pub fn claude(options: ClaudeOptions) -> CommandBackedExecutor {
+        let base = if options.claude_code_router {
+            "npx -y @musistudio/claude-code-router@1.0.66 code"
+        } else {
+            "npx -y @anthropic-ai/claude-code@2.1.12"
+        };
+
+        let mut params = vec![
+            "-p".to_string(),
+            "--verbose".to_string(),
+            "--output-format=stream-json".to_string(),
+            "--input-format=stream-json".to_string(),
+            "--include-partial-messages".to_string(),
+            "--disallowedTools=AskUserQuestion".to_string(),
+        ];
+
+        if options.plan || options.approvals {
+            params.push("--permission-prompt-tool=stdio".to_string());
+            params.push("--permission-mode=bypassPermissions".to_string());
+        }
+        if options.dangerously_skip_permissions {
+            params.push("--dangerously-skip-permissions".to_string());
+        }
+        if let Some(model) = options.model {
+            params.extend(["--model".to_string(), model]);
+        }
+
         CommandBackedExecutor::new(CommandExecutorConfig {
             profile_id: ExecutorProfileId::new(ExecutorKind::Claude),
-            base_command: "claude".to_string(),
-            default_params: vec![],
-            cmd_overrides: CmdOverrides::default(),
+            base_command: base.to_string(),
+            default_params: params,
+            append_prompt: options.append_prompt,
+            cmd_overrides: options.cmd_overrides,
             capabilities: vec![ExecutorCapability::SessionFork],
         })
     }
 
-    pub fn cursor_default() -> CommandBackedExecutor {
+    pub fn claude_default() -> CommandBackedExecutor {
+        claude(ClaudeOptions::default())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct CursorAgentOptions {
+        pub append_prompt: AppendPrompt,
+        pub force: bool,
+        pub model: Option<String>,
+        pub cmd_overrides: CmdOverrides,
+    }
+
+    pub fn cursor_agent(options: CursorAgentOptions) -> CommandBackedExecutor {
+        let mut params = vec!["-p".to_string(), "--output-format=stream-json".to_string()];
+        if options.force {
+            params.push("--force".to_string());
+        }
+        if let Some(model) = options.model {
+            params.extend(["--model".to_string(), model]);
+        }
+
         CommandBackedExecutor::new(CommandExecutorConfig {
-            profile_id: ExecutorProfileId::new(ExecutorKind::Cursor),
+            profile_id: ExecutorProfileId::new(ExecutorKind::CursorAgent),
             base_command: "cursor-agent".to_string(),
-            default_params: vec![],
-            cmd_overrides: CmdOverrides::default(),
+            default_params: params,
+            append_prompt: options.append_prompt,
+            cmd_overrides: options.cmd_overrides,
             capabilities: vec![ExecutorCapability::SetupHelper],
         })
     }
 
-    pub fn droid_default() -> CommandBackedExecutor {
+    pub fn cursor_default() -> CommandBackedExecutor {
+        cursor_agent(CursorAgentOptions::default())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct DroidOptions {
+        pub append_prompt: AppendPrompt,
+        pub autonomy: Option<String>,
+        pub model: Option<String>,
+        pub reasoning_effort: Option<String>,
+        pub cmd_overrides: CmdOverrides,
+    }
+
+    pub fn droid(options: DroidOptions) -> CommandBackedExecutor {
+        let mut params = vec![
+            "exec".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ];
+        match options.autonomy.as_deref() {
+            Some("low") => params.extend(["--auto".to_string(), "low".to_string()]),
+            Some("medium") => params.extend(["--auto".to_string(), "medium".to_string()]),
+            Some("high") => params.extend(["--auto".to_string(), "high".to_string()]),
+            Some("skip-permissions-unsafe") | None => {
+                params.push("--skip-permissions-unsafe".to_string())
+            }
+            Some(_) => {}
+        }
+        if let Some(model) = options.model {
+            params.extend(["--model".to_string(), model]);
+        }
+        if let Some(reasoning) = options.reasoning_effort {
+            params.extend(["--reasoning-effort".to_string(), reasoning]);
+        }
+
         CommandBackedExecutor::new(CommandExecutorConfig {
             profile_id: ExecutorProfileId::new(ExecutorKind::Droid),
             base_command: "droid".to_string(),
-            default_params: vec![],
-            cmd_overrides: CmdOverrides::default(),
+            default_params: params,
+            append_prompt: options.append_prompt,
+            cmd_overrides: options.cmd_overrides,
             capabilities: vec![ExecutorCapability::SessionFork],
         })
+    }
+
+    pub fn droid_default() -> CommandBackedExecutor {
+        droid(DroidOptions::default())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct AmpOptions {
+        pub append_prompt: AppendPrompt,
+        pub dangerously_allow_all: bool,
+        pub cmd_overrides: CmdOverrides,
+    }
+
+    pub fn amp(options: AmpOptions) -> CommandBackedExecutor {
+        let mut params = vec!["--execute".to_string(), "--stream-json".to_string()];
+        if options.dangerously_allow_all {
+            params.push("--dangerously-allow-all".to_string());
+        }
+        CommandBackedExecutor::new(CommandExecutorConfig {
+            profile_id: ExecutorProfileId::new(ExecutorKind::Amp),
+            base_command: "npx -y @sourcegraph/amp@0.0.1764777697-g907e30".to_string(),
+            default_params: params,
+            append_prompt: options.append_prompt,
+            cmd_overrides: options.cmd_overrides,
+            capabilities: vec![ExecutorCapability::SessionFork],
+        })
+    }
+
+    pub fn amp_default() -> CommandBackedExecutor {
+        amp(AmpOptions::default())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct GeminiOptions {
+        pub append_prompt: AppendPrompt,
+        pub model: Option<String>,
+        pub yolo: bool,
+        pub cmd_overrides: CmdOverrides,
+    }
+
+    pub fn gemini(options: GeminiOptions) -> CommandBackedExecutor {
+        let mut params = vec!["--experimental-acp".to_string()];
+        if let Some(model) = options.model {
+            params.extend(["--model".to_string(), model]);
+        }
+        if options.yolo {
+            params.extend([
+                "--yolo".to_string(),
+                "--allowed-tools".to_string(),
+                "run_shell_command".to_string(),
+            ]);
+        }
+        CommandBackedExecutor::new(CommandExecutorConfig {
+            profile_id: ExecutorProfileId::new(ExecutorKind::Gemini),
+            base_command: "npx -y @google/gemini-cli@0.23.0".to_string(),
+            default_params: params,
+            append_prompt: options.append_prompt,
+            cmd_overrides: options.cmd_overrides,
+            capabilities: vec![ExecutorCapability::SessionFork],
+        })
+    }
+
+    pub fn gemini_default() -> CommandBackedExecutor {
+        gemini(GeminiOptions::default())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OpencodeOptions {
+        pub append_prompt: AppendPrompt,
+        pub model: Option<String>,
+        pub variant: Option<String>,
+        pub mode: Option<String>,
+        pub auto_approve: bool,
+        pub cmd_overrides: CmdOverrides,
+    }
+
+    impl Default for OpencodeOptions {
+        fn default() -> Self {
+            Self {
+                append_prompt: AppendPrompt::default(),
+                model: None,
+                variant: None,
+                mode: None,
+                auto_approve: true,
+                cmd_overrides: CmdOverrides::default(),
+            }
+        }
+    }
+
+    pub fn opencode(options: OpencodeOptions) -> CommandBackedExecutor {
+        let mut params = vec![
+            "serve".to_string(),
+            "--hostname".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            "0".to_string(),
+        ];
+        if let Some(model) = options.model {
+            params.extend(["--model".to_string(), model]);
+        }
+        if let Some(variant) = options.variant {
+            params.extend(["--variant".to_string(), variant]);
+        }
+        if let Some(mode) = options.mode {
+            params.extend(["--agent".to_string(), mode]);
+        }
+
+        let mut cmd_overrides = options.cmd_overrides;
+        let mut env = cmd_overrides.env.unwrap_or_default();
+        if !env.contains_key("OPENCODE_PERMISSION") {
+            if options.auto_approve {
+                env.insert(
+                    "OPENCODE_PERMISSION".to_string(),
+                    "{\"question\":\"deny\"}".to_string(),
+                );
+            } else {
+                env.insert(
+                    "OPENCODE_PERMISSION".to_string(),
+                    "{\"edit\":\"ask\",\"bash\":\"ask\",\"webfetch\":\"ask\",\"doom_loop\":\"ask\",\"external_directory\":\"ask\",\"question\":\"deny\"}".to_string(),
+                );
+            }
+        }
+        cmd_overrides.env = Some(env);
+
+        CommandBackedExecutor::new(CommandExecutorConfig {
+            profile_id: ExecutorProfileId::new(ExecutorKind::Opencode),
+            base_command: "npx -y opencode-ai@1.1.25".to_string(),
+            default_params: params,
+            append_prompt: options.append_prompt,
+            cmd_overrides,
+            capabilities: vec![ExecutorCapability::SessionFork],
+        })
+    }
+
+    pub fn opencode_default() -> CommandBackedExecutor {
+        opencode(OpencodeOptions::default())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct QwenCodeOptions {
+        pub append_prompt: AppendPrompt,
+        pub yolo: bool,
+        pub cmd_overrides: CmdOverrides,
+    }
+
+    pub fn qwen_code(options: QwenCodeOptions) -> CommandBackedExecutor {
+        let mut params = vec!["--experimental-acp".to_string()];
+        if options.yolo {
+            params.push("--yolo".to_string());
+        }
+        CommandBackedExecutor::new(CommandExecutorConfig {
+            profile_id: ExecutorProfileId::new(ExecutorKind::QwenCode),
+            base_command: "npx -y @qwen-code/qwen-code@0.2.1".to_string(),
+            default_params: params,
+            append_prompt: options.append_prompt,
+            cmd_overrides: options.cmd_overrides,
+            capabilities: vec![ExecutorCapability::SessionFork],
+        })
+    }
+
+    pub fn qwen_code_default() -> CommandBackedExecutor {
+        qwen_code(QwenCodeOptions::default())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct CopilotOptions {
+        pub append_prompt: AppendPrompt,
+        pub model: Option<String>,
+        pub allow_all_tools: bool,
+        pub allow_tool: Option<String>,
+        pub deny_tool: Option<String>,
+        pub add_dir: Option<Vec<String>>,
+        pub disable_mcp_server: Option<Vec<String>>,
+        pub cmd_overrides: CmdOverrides,
+    }
+
+    pub fn copilot(options: CopilotOptions) -> CommandBackedExecutor {
+        let mut params = vec![
+            "--no-color".to_string(),
+            "--log-level".to_string(),
+            "debug".to_string(),
+        ];
+        if options.allow_all_tools {
+            params.push("--allow-all-tools".to_string());
+        }
+        if let Some(model) = options.model {
+            params.extend(["--model".to_string(), model]);
+        }
+        if let Some(tool) = options.allow_tool {
+            params.extend(["--allow-tool".to_string(), tool]);
+        }
+        if let Some(tool) = options.deny_tool {
+            params.extend(["--deny-tool".to_string(), tool]);
+        }
+        if let Some(dirs) = options.add_dir {
+            for dir in dirs {
+                params.extend(["--add-dir".to_string(), dir]);
+            }
+        }
+        if let Some(servers) = options.disable_mcp_server {
+            for server in servers {
+                params.extend(["--disable-mcp-server".to_string(), server]);
+            }
+        }
+        CommandBackedExecutor::new(CommandExecutorConfig {
+            profile_id: ExecutorProfileId::new(ExecutorKind::Copilot),
+            base_command: "npx -y @github/copilot@0.0.375".to_string(),
+            default_params: params,
+            append_prompt: options.append_prompt,
+            cmd_overrides: options.cmd_overrides,
+            capabilities: vec![ExecutorCapability::SessionFork],
+        })
+    }
+
+    pub fn copilot_default() -> CommandBackedExecutor {
+        copilot(CopilotOptions::default())
     }
 
     pub fn custom_command(
@@ -569,6 +919,7 @@ pub mod adapters {
             profile_id,
             base_command: base_command.into(),
             default_params,
+            append_prompt: AppendPrompt::default(),
             cmd_overrides,
             capabilities,
         })
@@ -648,5 +999,26 @@ mod tests {
         let output = child.wait_with_output().await.expect("wait");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout, "session-123");
+    }
+
+    #[test]
+    fn adapters_cover_reference_providers() {
+        let amp = adapters::amp_default();
+        let gemini = adapters::gemini_default();
+        let opencode = adapters::opencode_default();
+        let qwen = adapters::qwen_code_default();
+        let copilot = adapters::copilot_default();
+
+        assert!(matches!(amp.profile_id().executor, ExecutorKind::Amp));
+        assert!(matches!(gemini.profile_id().executor, ExecutorKind::Gemini));
+        assert!(matches!(
+            opencode.profile_id().executor,
+            ExecutorKind::Opencode
+        ));
+        assert!(matches!(qwen.profile_id().executor, ExecutorKind::QwenCode));
+        assert!(matches!(
+            copilot.profile_id().executor,
+            ExecutorKind::Copilot
+        ));
     }
 }

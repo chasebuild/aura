@@ -73,9 +73,14 @@ pub struct TransitionRule {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutorKind {
+    Amp,
+    Gemini,
     Codex,
     Claude,
-    Cursor,
+    Opencode,
+    QwenCode,
+    Copilot,
+    CursorAgent,
     Droid,
     Custom(String),
 }
