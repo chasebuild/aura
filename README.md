@@ -1,0 +1,45 @@
+# AURA Core Workspace
+
+AURA is a library-first Rust workspace for orchestrating multiple coding agents across local and remote workers.
+
+## Crates
+
+- `aura-contracts`: Shared domain models and execution/state machine enums.
+- `aura-store`: Storage traits and in-memory implementation.
+- `aura-git`: Git and worktree safety operations.
+- `aura-workspace`: Multi-repo workspace/worktree orchestration.
+- `aura-executors`: Agent executor abstraction and command-backed adapters.
+- `aura-worker-protocol`: JSON-RPC protocol/messages for remote worker daemons.
+- `aura-engine`: Deterministic state machine, prompt templates, and orchestration runtime.
+
+## Architecture
+
+### Execution Model
+
+1. Task execution enters `Queued`.
+2. Engine transitions through deterministic stages: `PrepareWorkspace -> Setup -> CodingInitial -> Cleanup -> Review -> Done`.
+3. Follow-up loops are supported from `Review -> CodingFollowUp -> Cleanup -> Review`.
+4. Failures can transition from any running stage to `Failed`.
+5. Cancellation transitions to `Cancelled` with best-effort process interruption.
+
+### Status Model (Hybrid)
+
+- Canonical internal states are enforced by the engine.
+- Board columns are customizable and map to canonical states.
+- Transition rules validate user-driven moves without weakening engine invariants.
+
+### Remote Worker Model
+
+- JSON-RPC 2.0 over WebSocket.
+- Worker heartbeat interval: 5 seconds.
+- Offline timeout: 15 seconds.
+- Lost workers force running processes into a failed state (`WorkerLost`).
+
+## Testing Scope
+
+- State machine transition coverage.
+- Prompt template strict rendering.
+- Git safety and worktree recovery behavior.
+- Executor command/env behavior and session continuity.
+- Worker protocol and lease timeout semantics.
+- Cross-crate orchestration scenarios.

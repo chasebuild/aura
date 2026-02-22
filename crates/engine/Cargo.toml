@@ -1,0 +1,20 @@
+[package]
+name = "aura-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-contracts = { path = "../contracts" }
+aura-executors = { path = "../executors" }
+aura-git = { path = "../git" }
+aura-store = { path = "../store" }
+aura-worker-protocol = { path = "../worker-protocol" }
+async-trait.workspace = true
+chrono.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
