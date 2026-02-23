@@ -78,6 +78,7 @@ impl Default for RunOptions {
 pub struct RunOutcome {
     pub exit_code: Option<i32>,
     pub success: bool,
+    pub user_requested_exit: bool,
 }
 
 #[derive(Debug, Error)]
@@ -104,6 +105,7 @@ pub trait LogSink {
     fn on_status(&mut self, message: &str);
     fn on_agent_status(&mut self, _message: &str) {}
     fn on_exit(&mut self, code: Option<i32>);
+    fn on_key_event(&mut self, _key: KeyEvent) {}
 }
 
 pub struct PlainLogSink;
@@ -143,19 +145,29 @@ pub struct TuiLogSink {
     started_at: Instant,
     lines: VecDeque<TuiLogEntry>,
     max_lines: usize,
+    log_scroll: usize,
     title: String,
     status: String,
     agent_status: String,
+    input_text: String,
+    active_pane: TuiPane,
     terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiLineKind {
+    User,
     Agent,
     Thinking,
     Action,
     Error,
     Output,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiPane {
+    Logs,
+    Prompt,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +177,9 @@ struct TuiLogEntry {
 }
 
 fn classify_tui_line(stream: LogStream, line: &str) -> TuiLineKind {
+    if line.starts_with("user: ") {
+        return TuiLineKind::User;
+    }
     if line.starts_with("agent: ") {
         return TuiLineKind::Agent;
     }
@@ -182,6 +197,7 @@ fn classify_tui_line(stream: LogStream, line: &str) -> TuiLineKind {
 
 fn normalize_tui_line_text(kind: TuiLineKind, line: &str) -> String {
     match kind {
+        TuiLineKind::User => line.trim_start_matches("user: ").to_string(),
         TuiLineKind::Agent => line.trim_start_matches("agent: ").to_string(),
         TuiLineKind::Thinking => line.trim_start_matches("thinking: ").to_string(),
         TuiLineKind::Action => line.to_string(),
@@ -197,9 +213,12 @@ impl TuiLogSink {
             started_at: Instant::now(),
             lines: VecDeque::new(),
             max_lines: 500,
+            log_scroll: 0,
             title: "AURA Executor".to_string(),
             status: "starting".to_string(),
             agent_status: "Initializing".to_string(),
+            input_text: String::new(),
+            active_pane: TuiPane::Prompt,
             terminal,
         }
     }
@@ -236,7 +255,8 @@ impl TuiLogSink {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
-                    Constraint::Min(8),
+                    Constraint::Min(6),
+                    Constraint::Length(3),
                     Constraint::Length(1),
                 ])
                 .split(size);
@@ -256,17 +276,20 @@ impl TuiLogSink {
             frame.render_widget(header, chunks[0]);
 
             let logs_capacity = chunks[1].height.saturating_sub(2) as usize;
-            let visible_logs: Vec<TuiLogEntry> = self
-                .lines
-                .iter()
-                .rev()
-                .take(logs_capacity)
-                .rev()
-                .cloned()
-                .collect();
+            let max_log_scroll = self.lines.len().saturating_sub(logs_capacity);
+            let scroll = self.log_scroll.min(max_log_scroll);
+            let end = self.lines.len().saturating_sub(scroll);
+            let start = end.saturating_sub(logs_capacity);
+            let visible_logs: Vec<TuiLogEntry> =
+                self.lines.iter().skip(start).take(end - start).cloned().collect();
             let log_lines: Vec<Line> = visible_logs
                 .into_iter()
                 .map(|entry| match entry.kind {
+                    TuiLineKind::User => Line::from(vec![
+                        Span::styled(" USER ", Style::default().fg(Color::Black).bg(Color::White)),
+                        Span::raw(" "),
+                        Span::styled(entry.text, Style::default().fg(Color::White)),
+                    ]),
                     TuiLineKind::Agent => Line::from(vec![
                         Span::styled(" AGENT ", Style::default().fg(Color::White).bg(Color::Cyan)),
                         Span::raw(" "),
@@ -301,22 +324,139 @@ impl TuiLogSink {
                 })
                 .collect();
 
+            let logs_title = if max_log_scroll == 0 {
+                "Logs".to_string()
+            } else {
+                format!(
+                    "Logs ({}/{})",
+                    scroll,
+                    max_log_scroll
+                )
+            };
+            let logs_border = if self.active_pane == TuiPane::Logs {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
             let logs = Paragraph::new(Text::from(log_lines))
-                .block(Block::default().borders(Borders::ALL).title("Logs"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(logs_title)
+                        .border_style(logs_border),
+                )
                 .wrap(Wrap { trim: false });
             frame.render_widget(logs, chunks[1]);
 
+            let prompt_text = if self.input_text.is_empty() {
+                Text::from(Line::from(Span::styled(
+                    "Type a follow-up prompt and press Enter",
+                    Style::default().fg(Color::DarkGray),
+                )))
+            } else {
+                Text::from(self.input_text.clone())
+            };
+            let prompt_border = if self.active_pane == TuiPane::Prompt {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            let prompt = Paragraph::new(prompt_text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Prompt")
+                        .border_style(prompt_border),
+                )
+                .wrap(Wrap { trim: false });
+            frame.render_widget(prompt, chunks[2]);
+
+            let pane_text = match self.active_pane {
+                TuiPane::Logs => "Logs",
+                TuiPane::Prompt => "Prompt",
+            };
             let bar = Paragraph::new(Line::from(vec![
                 Span::styled("Run: ", Style::default().fg(Color::Yellow)),
                 Span::raw(self.status.clone()),
                 Span::raw("  |  "),
                 Span::styled("Agent: ", Style::default().fg(Color::Yellow)),
                 Span::raw(self.agent_status.clone()),
-                Span::raw("  |  q/Esc/Ctrl+C"),
+                Span::raw("  |  "),
+                Span::styled("Pane: ", Style::default().fg(Color::Yellow)),
+                Span::raw(pane_text),
+                Span::raw("  |  Tab=switch  Arrows/Page/Home/End=scroll  Enter=send  Esc/Ctrl+C=quit"),
             ]))
             .style(Style::default().fg(Color::White).bg(Color::DarkGray));
-            frame.render_widget(bar, chunks[2]);
+            frame.render_widget(bar, chunks[3]);
         });
+    }
+
+    fn set_input_text(&mut self, input: String) {
+        self.input_text = input;
+        self.redraw();
+    }
+
+    fn set_active_pane(&mut self, pane: TuiPane) {
+        self.active_pane = pane;
+        self.redraw();
+    }
+
+    fn active_pane(&self) -> TuiPane {
+        self.active_pane
+    }
+
+    fn toggle_pane(&mut self) {
+        self.active_pane = match self.active_pane {
+            TuiPane::Logs => TuiPane::Prompt,
+            TuiPane::Prompt => TuiPane::Logs,
+        };
+        self.redraw();
+    }
+
+    fn max_log_scroll(&self) -> usize {
+        self.lines.len().saturating_sub(1)
+    }
+
+    fn scroll_logs_up(&mut self, by: usize) {
+        if by == 0 {
+            return;
+        }
+        self.log_scroll = self.log_scroll.saturating_add(by).min(self.max_log_scroll());
+        self.redraw();
+    }
+
+    fn scroll_logs_down(&mut self, by: usize) {
+        if by == 0 {
+            return;
+        }
+        self.log_scroll = self.log_scroll.saturating_sub(by);
+        self.redraw();
+    }
+
+    fn scroll_logs_to_top(&mut self) {
+        self.log_scroll = self.max_log_scroll();
+        self.redraw();
+    }
+
+    fn scroll_logs_to_bottom(&mut self) {
+        self.log_scroll = 0;
+        self.redraw();
+    }
+
+    fn push_log_entry(&mut self, kind: TuiLineKind, text: String) {
+        if self.log_scroll > 0 {
+            self.log_scroll = self.log_scroll.saturating_add(1);
+        }
+        self.lines.push_back(TuiLogEntry { kind, text });
+        while self.lines.len() > self.max_lines {
+            let _ = self.lines.pop_front();
+        }
+        self.log_scroll = self.log_scroll.min(self.max_log_scroll());
+    }
+
+    fn on_user_prompt(&mut self, prompt: &str) {
+        self.push_log_entry(TuiLineKind::User, summarize_text(prompt, 240));
+        self.redraw();
     }
 }
 
@@ -337,13 +477,10 @@ impl LogSink for TuiLogSink {
 
     fn on_line(&mut self, stream: LogStream, line: &str) {
         let kind = classify_tui_line(stream, line);
-        self.lines.push_back(TuiLogEntry {
+        self.push_log_entry(
             kind,
-            text: normalize_tui_line_text(kind, line),
-        });
-        while self.lines.len() > self.max_lines {
-            let _ = self.lines.pop_front();
-        }
+            normalize_tui_line_text(kind, line),
+        );
         self.status = "running".to_string();
         self.redraw();
     }
@@ -366,6 +503,19 @@ impl LogSink for TuiLogSink {
             self.agent_status = "Error".to_string();
         }
         self.redraw();
+    }
+
+    fn on_key_event(&mut self, key: KeyEvent) {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return;
+        }
+        if matches!(key.code, KeyCode::Tab) {
+            self.toggle_pane();
+            return;
+        }
+        if self.active_pane == TuiPane::Logs {
+            let _ = handle_logs_navigation_key(self, key);
+        }
     }
 }
 
@@ -545,7 +695,7 @@ pub async fn run_with_default_sink(options: RunOptions) -> Result<RunOutcome, Cl
     let use_tui = options.tui && io::stdout().is_terminal();
     if use_tui {
         let mut sink = TuiLogSink::new();
-        run_executor_inner(options, &mut sink, true).await
+        run_tui_session(options, &mut sink).await
     } else {
         let mut sink = PlainLogSink;
         run_executor_inner(options, &mut sink, false).await
@@ -557,6 +707,44 @@ pub async fn run_executor(
     sink: &mut dyn LogSink,
 ) -> Result<RunOutcome, CliError> {
     run_executor_inner(options, sink, false).await
+}
+
+enum TuiPromptAction {
+    Submit(String),
+    Quit,
+}
+
+enum PromptInputUpdate {
+    Continue,
+    Submit(String),
+    Quit,
+}
+
+async fn run_tui_session(
+    mut options: RunOptions,
+    sink: &mut TuiLogSink,
+) -> Result<RunOutcome, CliError> {
+    loop {
+        sink.set_input_text(String::new());
+        sink.on_user_prompt(&options.prompt);
+        let mut outcome = run_executor_inner(options.clone(), sink, true).await?;
+
+        if outcome.user_requested_exit {
+            return Ok(outcome);
+        }
+
+        sink.set_active_pane(TuiPane::Prompt);
+        sink.on_status("awaiting prompt (Tab=switch, Enter=send, Esc/Ctrl+C=quit)");
+        match read_tui_prompt_action(sink)? {
+            TuiPromptAction::Submit(prompt) => {
+                options.prompt = prompt;
+            }
+            TuiPromptAction::Quit => {
+                outcome.user_requested_exit = true;
+                return Ok(outcome);
+            }
+        }
+    }
 }
 
 async fn run_executor_inner(
@@ -951,31 +1139,29 @@ pub async fn stream_spawned(
     let mut formatter = LogFormatter::new(executor_kind);
     let mut last_wait_status_at = Instant::now();
     let mut quit_requested_at: Option<Instant> = None;
-    let mut completion_reported = false;
+    let mut user_requested_exit = false;
 
     loop {
-        if enable_keyboard_controls && should_quit_from_keyboard().unwrap_or(false) {
-            if got_exit_status && streams_closed >= expected_streams {
-                break;
-            }
-            if quit_requested_at.is_none() {
-                sink.on_status("stopping subprocess (user requested exit)");
-                if let Some(interrupt_sender) = spawned.interrupt_sender.take() {
-                    let _ = interrupt_sender.send(());
+        if enable_keyboard_controls {
+            if let Ok(Some(key)) = read_keyboard_event() {
+                sink.on_key_event(key);
+                if is_quit_key(key) {
+                    if quit_requested_at.is_none() {
+                        user_requested_exit = true;
+                        sink.on_status("stopping subprocess (user requested exit)");
+                        if let Some(interrupt_sender) = spawned.interrupt_sender.take() {
+                            let _ = interrupt_sender.send(());
+                        }
+                    }
+                    quit_requested_at.get_or_insert_with(Instant::now);
+                    let _ = child.start_kill();
                 }
             }
-            quit_requested_at.get_or_insert_with(Instant::now);
-            let _ = child.start_kill();
         }
 
         if !got_exit_status && let Some(status) = child.try_wait()? {
             got_exit_status = true;
             exit_code = status.code();
-        }
-
-        if got_exit_status && streams_closed >= expected_streams && !completion_reported {
-            sink.on_exit(exit_code);
-            completion_reported = true;
         }
 
         if let Some(requested_at) = quit_requested_at {
@@ -1002,10 +1188,7 @@ pub async fn stream_spawned(
                 continue;
             }
         }) else {
-            if got_exit_status
-                && streams_closed >= expected_streams
-                && (!enable_keyboard_controls || quit_requested_at.is_some())
-            {
+            if got_exit_status && streams_closed >= expected_streams {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1035,10 +1218,7 @@ pub async fn stream_spawned(
             }
         }
 
-        if got_exit_status
-            && streams_closed >= expected_streams
-            && (!enable_keyboard_controls || quit_requested_at.is_some())
-        {
+        if got_exit_status && streams_closed >= expected_streams {
             break;
         }
     }
@@ -1050,23 +1230,22 @@ pub async fn stream_spawned(
         ));
     }
 
-    if !completion_reported {
-        sink.on_exit(exit_code);
-    }
+    sink.on_exit(exit_code);
     Ok(RunOutcome {
         success: exit_code == Some(0),
         exit_code,
+        user_requested_exit,
     })
 }
 
-fn should_quit_from_keyboard() -> io::Result<bool> {
+fn read_keyboard_event() -> io::Result<Option<KeyEvent>> {
     if !event::poll(Duration::from_millis(0))? {
-        return Ok(false);
+        return Ok(None);
     }
     let Event::Key(key) = event::read()? else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(is_quit_key(key))
+    Ok(Some(key))
 }
 
 fn is_quit_key(key: KeyEvent) -> bool {
@@ -1078,6 +1257,142 @@ fn is_quit_key(key: KeyEvent) -> bool {
         KeyCode::Esc => true,
         KeyCode::Char('q') | KeyCode::Char('Q') => true,
         KeyCode::Char('c') | KeyCode::Char('C') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+fn apply_prompt_input_key(input: &mut String, key: KeyEvent) -> PromptInputUpdate {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return PromptInputUpdate::Continue;
+    }
+
+    if is_prompt_quit_key(key) {
+        return PromptInputUpdate::Quit;
+    }
+
+    match key.code {
+        KeyCode::Enter => {
+            let prompt = input.trim();
+            if prompt.is_empty() {
+                PromptInputUpdate::Continue
+            } else {
+                let prompt = prompt.to_string();
+                input.clear();
+                PromptInputUpdate::Submit(prompt)
+            }
+        }
+        KeyCode::Backspace => {
+            input.pop();
+            PromptInputUpdate::Continue
+        }
+        KeyCode::Tab => {
+            input.push('\t');
+            PromptInputUpdate::Continue
+        }
+        KeyCode::Char(c) => {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                PromptInputUpdate::Continue
+            } else {
+                input.push(c);
+                PromptInputUpdate::Continue
+            }
+        }
+        _ => PromptInputUpdate::Continue,
+    }
+}
+
+fn is_prompt_quit_key(key: KeyEvent) -> bool {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return false;
+    }
+
+    matches!(key.code, KeyCode::Esc)
+        || matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn read_tui_prompt_action(sink: &mut TuiLogSink) -> io::Result<TuiPromptAction> {
+    let mut input = String::new();
+    sink.set_input_text(String::new());
+
+    loop {
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+
+        match event::read()? {
+            Event::Key(key) => {
+                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    continue;
+                }
+                if matches!(key.code, KeyCode::Tab) {
+                    sink.toggle_pane();
+                    continue;
+                }
+
+                if sink.active_pane() == TuiPane::Logs {
+                    if is_prompt_quit_key(key) {
+                        sink.set_input_text(String::new());
+                        return Ok(TuiPromptAction::Quit);
+                    }
+                    if handle_logs_navigation_key(sink, key) {
+                        continue;
+                    }
+                    continue;
+                }
+
+                match apply_prompt_input_key(&mut input, key) {
+                    PromptInputUpdate::Continue => sink.set_input_text(input.clone()),
+                    PromptInputUpdate::Submit(prompt) => {
+                        sink.set_input_text(String::new());
+                        return Ok(TuiPromptAction::Submit(prompt));
+                    }
+                    PromptInputUpdate::Quit => {
+                        sink.set_input_text(String::new());
+                        return Ok(TuiPromptAction::Quit);
+                    }
+                }
+            }
+            Event::Paste(pasted) => {
+                if sink.active_pane() == TuiPane::Prompt {
+                    input.push_str(&pasted);
+                    sink.set_input_text(input.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn handle_logs_navigation_key(sink: &mut TuiLogSink, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up => {
+            sink.scroll_logs_up(1);
+            true
+        }
+        KeyCode::Down => {
+            sink.scroll_logs_down(1);
+            true
+        }
+        KeyCode::PageUp => {
+            sink.scroll_logs_up(10);
+            true
+        }
+        KeyCode::PageDown => {
+            sink.scroll_logs_down(10);
+            true
+        }
+        KeyCode::Home => {
+            sink.scroll_logs_to_top();
+            true
+        }
+        KeyCode::End => {
+            sink.scroll_logs_to_bottom();
+            true
+        }
         _ => false,
     }
 }
@@ -1198,6 +1513,44 @@ mod tests {
             KeyCode::Char('x'),
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn prompt_input_keys_support_edit_submit_and_quit() {
+        let mut input = String::new();
+        assert!(matches!(
+            apply_prompt_input_key(&mut input, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+            PromptInputUpdate::Continue
+        ));
+        assert!(matches!(
+            apply_prompt_input_key(&mut input, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            PromptInputUpdate::Continue
+        ));
+        assert_eq!(input, "hi");
+
+        assert!(matches!(
+            apply_prompt_input_key(&mut input, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            PromptInputUpdate::Continue
+        ));
+        assert_eq!(input, "hiq");
+
+        assert!(matches!(
+            apply_prompt_input_key(&mut input, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            PromptInputUpdate::Continue
+        ));
+        assert_eq!(input, "hi");
+
+        let submit = apply_prompt_input_key(&mut input, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match submit {
+            PromptInputUpdate::Submit(prompt) => assert_eq!(prompt, "hi"),
+            _ => panic!("expected submit"),
+        }
+        assert!(input.is_empty());
+
+        assert!(matches!(
+            apply_prompt_input_key(&mut input, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            PromptInputUpdate::Quit
+        ));
     }
 
     #[test]
