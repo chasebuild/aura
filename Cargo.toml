@@ -8,6 +8,7 @@ members = [
   "crates/executors",
   "crates/worker-protocol",
   "crates/engine",
+  "crates/cli",
 ]
 
 [workspace.package]

@@ -2,7 +2,7 @@ use aura_contracts::ExecutorKind;
 
 use crate::{
     AppendPrompt, CmdOverrides, CommandBackedExecutor, CommandExecutorConfig, ExecutorCapability,
-    ExecutorProfileId,
+    ExecutorProfileId, PromptInputMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -23,6 +23,7 @@ pub fn qwen_code(options: QwenCodeOptions) -> CommandBackedExecutor {
         base_command: "npx -y @qwen-code/qwen-code@0.2.1".to_string(),
         default_params: params,
         append_prompt: options.append_prompt,
+        prompt_input_mode: PromptInputMode::EnvVar,
         cmd_overrides: options.cmd_overrides,
         capabilities: vec![ExecutorCapability::SessionFork],
     })

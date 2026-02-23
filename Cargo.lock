@@ -53,6 +53,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aura-cli"
+version = "0.1.0"
+dependencies = [
+ "aura-contracts",
+ "aura-executors",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "aura-contracts"
 version = "0.1.0"
 dependencies = [

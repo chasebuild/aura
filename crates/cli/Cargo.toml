@@ -1,0 +1,19 @@
+[package]
+name = "aura-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aura"
+path = "src/main.rs"
+
+[dependencies]
+aura-contracts = { path = "../contracts" }
+aura-executors = { path = "../executors" }
+tokio.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

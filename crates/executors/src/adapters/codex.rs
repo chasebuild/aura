@@ -2,7 +2,7 @@ use aura_contracts::ExecutorKind;
 
 use crate::{
     AppendPrompt, CmdOverrides, CommandBackedExecutor, CommandExecutorConfig, ExecutorCapability,
-    ExecutorProfileId,
+    ExecutorProfileId, PromptInputMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -15,7 +15,11 @@ pub struct CodexOptions {
 }
 
 pub fn codex(options: CodexOptions) -> CommandBackedExecutor {
-    let mut params = vec!["app-server".to_string()];
+    let mut params = vec![
+        "exec".to_string(),
+        "--json".to_string(),
+        "--skip-git-repo-check".to_string(),
+    ];
     if let Some(model) = options.model {
         params.extend(["--model".to_string(), model]);
     }
@@ -28,9 +32,10 @@ pub fn codex(options: CodexOptions) -> CommandBackedExecutor {
 
     CommandBackedExecutor::new(CommandExecutorConfig {
         profile_id: ExecutorProfileId::new(ExecutorKind::Codex),
-        base_command: "npx -y @openai/codex@0.86.0".to_string(),
+        base_command: "codex".to_string(),
         default_params: params,
         append_prompt: options.append_prompt,
+        prompt_input_mode: PromptInputMode::Arg,
         cmd_overrides: options.cmd_overrides,
         capabilities: vec![
             ExecutorCapability::SessionFork,

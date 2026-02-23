@@ -2,7 +2,7 @@ use aura_contracts::ExecutorKind;
 
 use crate::{
     AppendPrompt, CmdOverrides, CommandBackedExecutor, CommandExecutorConfig, ExecutorCapability,
-    ExecutorProfileId,
+    ExecutorProfileId, PromptInputMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -27,6 +27,7 @@ pub fn cursor_agent(options: CursorAgentOptions) -> CommandBackedExecutor {
         base_command: "cursor-agent".to_string(),
         default_params: params,
         append_prompt: options.append_prompt,
+        prompt_input_mode: PromptInputMode::Stdin,
         cmd_overrides: options.cmd_overrides,
         capabilities: vec![ExecutorCapability::SetupHelper],
     })

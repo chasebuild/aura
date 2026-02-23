@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use aura_contracts::ExecutorKind;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{RwLock, oneshot};
 
@@ -124,6 +125,15 @@ impl AppendPrompt {
             None => prompt.to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptInputMode {
+    #[default]
+    EnvVar,
+    Arg,
+    Stdin,
 }
 
 #[derive(Debug, Clone)]
@@ -397,6 +407,8 @@ pub struct CommandExecutorConfig {
     pub base_command: String,
     pub default_params: Vec<String>,
     pub append_prompt: AppendPrompt,
+    #[serde(default)]
+    pub prompt_input_mode: PromptInputMode,
     pub cmd_overrides: CmdOverrides,
     pub capabilities: Vec<ExecutorCapability>,
 }
@@ -435,16 +447,28 @@ impl CommandBackedExecutor {
 
         let parts = self.config.command_builder().build_initial()?;
         let mut cmd = Command::new(parts.program);
-        cmd.args(parts.args)
-            .current_dir(current_dir)
-            .env("AURA_PROMPT", combined_prompt)
-            .env(
-                "AURA_COMMIT_REMINDER",
-                merged_env.commit_reminder.to_string(),
-            )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+        cmd.args(parts.args).current_dir(current_dir).env(
+            "AURA_COMMIT_REMINDER",
+            merged_env.commit_reminder.to_string(),
+        );
+
+        match self.config.prompt_input_mode {
+            PromptInputMode::EnvVar => {
+                cmd.env("AURA_PROMPT", combined_prompt.clone())
+                    .stdin(Stdio::null());
+            }
+            PromptInputMode::Arg => {
+                cmd.env("AURA_PROMPT", combined_prompt.clone())
+                    .arg(combined_prompt.clone())
+                    .stdin(Stdio::null());
+            }
+            PromptInputMode::Stdin => {
+                cmd.env("AURA_PROMPT", combined_prompt.clone())
+                    .stdin(Stdio::piped());
+            }
+        }
+
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         if review_mode {
             cmd.env("AURA_REVIEW_MODE", "1");
@@ -458,7 +482,16 @@ impl CommandBackedExecutor {
             cmd.env(k, v);
         }
 
-        let child = cmd.spawn()?;
+        let mut child = cmd.spawn()?;
+        if matches!(self.config.prompt_input_mode, PromptInputMode::Stdin)
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            tokio::spawn(async move {
+                let _ = stdin.write_all(combined_prompt.as_bytes()).await;
+                let _ = stdin.write_all(b"\n").await;
+                let _ = stdin.shutdown().await;
+            });
+        }
         Ok(SpawnedChild {
             child,
             exit_signal: None,
@@ -565,6 +598,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_mode_arg_passes_prompt_as_argument() {
+        let executor = CommandBackedExecutor::new(CommandExecutorConfig {
+            profile_id: ExecutorProfileId::new(ExecutorKind::Custom("arg-test".to_string())),
+            base_command: "python".to_string(),
+            default_params: vec![
+                "-c".to_string(),
+                "import sys; print(sys.argv[1])".to_string(),
+            ],
+            append_prompt: AppendPrompt::default(),
+            prompt_input_mode: PromptInputMode::Arg,
+            cmd_overrides: CmdOverrides::default(),
+            capabilities: vec![],
+        });
+
+        let child = executor
+            .spawn_initial(
+                Path::new("."),
+                "hello-from-arg",
+                &ExecutionEnv::new(
+                    RepoContext {
+                        workspace_root: PathBuf::from("."),
+                        repo_names: vec![],
+                    },
+                    false,
+                ),
+            )
+            .await
+            .expect("spawn")
+            .child;
+
+        let output = child.wait_with_output().await.expect("wait");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "hello-from-arg");
+    }
+
+    #[tokio::test]
+    async fn prompt_mode_stdin_writes_prompt_to_stdin() {
+        let executor = CommandBackedExecutor::new(CommandExecutorConfig {
+            profile_id: ExecutorProfileId::new(ExecutorKind::Custom("stdin-test".to_string())),
+            base_command: "sh".to_string(),
+            default_params: vec!["-lc".to_string(), "cat".to_string()],
+            append_prompt: AppendPrompt::default(),
+            prompt_input_mode: PromptInputMode::Stdin,
+            cmd_overrides: CmdOverrides::default(),
+            capabilities: vec![],
+        });
+
+        let child = executor
+            .spawn_initial(
+                Path::new("."),
+                "hello-from-stdin",
+                &ExecutionEnv::new(
+                    RepoContext {
+                        workspace_root: PathBuf::from("."),
+                        repo_names: vec![],
+                    },
+                    false,
+                ),
+            )
+            .await
+            .expect("spawn")
+            .child;
+
+        let output = child.wait_with_output().await.expect("wait");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "hello-from-stdin");
+    }
+
+    #[tokio::test]
     async fn follow_up_sets_session_env() {
         let executor = adapters::custom_command(
             ExecutorProfileId::new(ExecutorKind::Custom("test".to_string())),
@@ -618,5 +720,42 @@ mod tests {
             copilot.profile_id().executor,
             ExecutorKind::Copilot
         ));
+    }
+
+    #[tokio::test]
+    async fn codex_adapter_uses_executor_path_with_prompt_argument() {
+        let executor = adapters::codex(adapters::CodexOptions {
+            append_prompt: AppendPrompt::default(),
+            model: None,
+            sandbox: None,
+            ask_for_approval: None,
+            cmd_overrides: CmdOverrides {
+                base_command_override: Some("echo".to_string()),
+                additional_params: None,
+                env: None,
+            },
+        });
+
+        let child = executor
+            .spawn_initial(
+                Path::new("."),
+                "hello-codex",
+                &ExecutionEnv::new(
+                    RepoContext {
+                        workspace_root: PathBuf::from("."),
+                        repo_names: vec![],
+                    },
+                    false,
+                ),
+            )
+            .await
+            .expect("spawn")
+            .child;
+
+        let output = child.wait_with_output().await.expect("wait");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("exec"));
+        assert!(stdout.contains("--json"));
+        assert!(stdout.contains("hello-codex"));
     }
 }

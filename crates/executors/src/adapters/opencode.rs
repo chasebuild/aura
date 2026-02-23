@@ -2,7 +2,7 @@ use aura_contracts::ExecutorKind;
 
 use crate::{
     AppendPrompt, CmdOverrides, CommandBackedExecutor, CommandExecutorConfig, ExecutorCapability,
-    ExecutorProfileId,
+    ExecutorProfileId, PromptInputMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +68,7 @@ pub fn opencode(options: OpencodeOptions) -> CommandBackedExecutor {
         base_command: "npx -y opencode-ai@1.1.25".to_string(),
         default_params: params,
         append_prompt: options.append_prompt,
+        prompt_input_mode: PromptInputMode::EnvVar,
         cmd_overrides,
         capabilities: vec![ExecutorCapability::SessionFork],
     })

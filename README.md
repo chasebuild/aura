@@ -11,6 +11,7 @@ AURA is a library-first Rust workspace for orchestrating multiple coding agents 
 - `aura-executors`: Agent executor abstraction and command-backed adapters.
 - `aura-worker-protocol`: JSON-RPC protocol/messages for remote worker daemons.
 - `aura-engine`: Deterministic state machine, prompt templates, and orchestration runtime.
+- `aura-cli`: TUI/CLI runner for launching executors and streaming subprocess logs.
 
 ## Architecture
 
@@ -43,3 +44,21 @@ AURA is a library-first Rust workspace for orchestrating multiple coding agents 
 - Executor command/env behavior and session continuity.
 - Worker protocol and lease timeout semantics.
 - Cross-crate orchestration scenarios.
+
+## Run The Executor CLI
+
+```bash
+cargo run -p aura-cli -- run --executor codex --prompt "Inspect this repository and suggest fixes"
+```
+
+Use plain stream mode:
+
+```bash
+cargo run -p aura-cli -- run --executor claude --prompt "Review recent changes" --no-tui
+```
+
+Run a custom command executor:
+
+```bash
+cargo run -p aura-cli -- run --executor custom --prompt "ignored" --base-command sh --param -lc --param 'echo out_line; echo err_line 1>&2' --no-tui
+```

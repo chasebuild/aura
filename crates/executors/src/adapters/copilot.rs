@@ -2,7 +2,7 @@ use aura_contracts::ExecutorKind;
 
 use crate::{
     AppendPrompt, CmdOverrides, CommandBackedExecutor, CommandExecutorConfig, ExecutorCapability,
-    ExecutorProfileId,
+    ExecutorProfileId, PromptInputMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -51,6 +51,7 @@ pub fn copilot(options: CopilotOptions) -> CommandBackedExecutor {
         base_command: "npx -y @github/copilot@0.0.375".to_string(),
         default_params: params,
         append_prompt: options.append_prompt,
+        prompt_input_mode: PromptInputMode::EnvVar,
         cmd_overrides: options.cmd_overrides,
         capabilities: vec![ExecutorCapability::SessionFork],
     })
