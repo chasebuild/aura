@@ -158,6 +158,9 @@ pub struct TuiLogSink {
 enum TuiLineKind {
     User,
     Agent,
+    Code,
+    Json,
+    Diff,
     Thinking,
     Action,
     Error,
@@ -180,6 +183,15 @@ fn classify_tui_line(stream: LogStream, line: &str) -> TuiLineKind {
     if line.starts_with("user: ") {
         return TuiLineKind::User;
     }
+    if line.starts_with("code: ") || line.starts_with("code| ") {
+        return TuiLineKind::Code;
+    }
+    if line.starts_with("json: ") || line.starts_with("json| ") {
+        return TuiLineKind::Json;
+    }
+    if line.starts_with("diff| ") {
+        return TuiLineKind::Diff;
+    }
     if line.starts_with("agent: ") {
         return TuiLineKind::Agent;
     }
@@ -199,6 +211,15 @@ fn normalize_tui_line_text(kind: TuiLineKind, line: &str) -> String {
     match kind {
         TuiLineKind::User => line.trim_start_matches("user: ").to_string(),
         TuiLineKind::Agent => line.trim_start_matches("agent: ").to_string(),
+        TuiLineKind::Code => line
+            .trim_start_matches("code: ")
+            .trim_start_matches("code| ")
+            .to_string(),
+        TuiLineKind::Json => line
+            .trim_start_matches("json: ")
+            .trim_start_matches("json| ")
+            .to_string(),
+        TuiLineKind::Diff => line.trim_start_matches("diff| ").to_string(),
         TuiLineKind::Thinking => line.trim_start_matches("thinking: ").to_string(),
         TuiLineKind::Action => line.to_string(),
         TuiLineKind::Error => line.to_string(),
@@ -294,6 +315,24 @@ impl TuiLogSink {
                         Span::styled(" AGENT ", Style::default().fg(Color::White).bg(Color::Cyan)),
                         Span::raw(" "),
                         Span::styled(entry.text, Style::default().fg(Color::White)),
+                    ]),
+                    TuiLineKind::Code => Line::from(vec![
+                        Span::styled(
+                            " CODE ",
+                            Style::default().fg(Color::White).bg(Color::DarkGray),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(entry.text, Style::default().fg(Color::Gray)),
+                    ]),
+                    TuiLineKind::Json => Line::from(vec![
+                        Span::styled(" JSON ", Style::default().fg(Color::Black).bg(Color::Green)),
+                        Span::raw(" "),
+                        Span::styled(entry.text, Style::default().fg(Color::Green)),
+                    ]),
+                    TuiLineKind::Diff => Line::from(vec![
+                        Span::styled(" DIFF ", Style::default().fg(Color::White).bg(Color::Magenta)),
+                        Span::raw(" "),
+                        Span::styled(entry.text.clone(), diff_line_style(&entry.text)),
                     ]),
                     TuiLineKind::Thinking => Line::from(vec![
                         Span::styled(
@@ -458,6 +497,27 @@ impl TuiLogSink {
         self.push_log_entry(TuiLineKind::User, summarize_text(prompt, 240));
         self.redraw();
     }
+}
+
+fn diff_line_style(line: &str) -> Style {
+    let text = line.trim_start();
+    if text.starts_with("@@") {
+        return Style::default().fg(Color::Yellow);
+    }
+    if text.starts_with("diff --git")
+        || text.starts_with("index ")
+        || text.starts_with("--- ")
+        || text.starts_with("+++ ")
+    {
+        return Style::default().fg(Color::Cyan);
+    }
+    if text.starts_with('+') {
+        return Style::default().fg(Color::Green);
+    }
+    if text.starts_with('-') {
+        return Style::default().fg(Color::Red);
+    }
+    Style::default().fg(Color::Magenta)
 }
 
 impl Default for TuiLogSink {
@@ -1054,13 +1114,9 @@ fn format_codex_event(line: &str) -> Option<Vec<DisplayEvent>> {
                     if text.is_empty() {
                         return None;
                     }
-                    Some(vec![
-                        DisplayEvent::Line(
-                            LogStream::Stdout,
-                            format!("agent: {}", summarize_text(text, 200)),
-                        ),
-                        DisplayEvent::AgentStatus("Responding".to_string()),
-                    ])
+                    let mut events = format_agent_message(text);
+                    events.push(DisplayEvent::AgentStatus("Responding".to_string()));
+                    Some(events)
                 }
                 "reasoning" => {
                     let text = item.get("text").and_then(Value::as_str).unwrap_or("");
@@ -1086,6 +1142,157 @@ fn format_codex_event(line: &str) -> Option<Vec<DisplayEvent>> {
         }
         _ => None,
     }
+}
+
+fn format_agent_message(text: &str) -> Vec<DisplayEvent> {
+    let mut events = Vec::new();
+    let mut prose_lines: Vec<String> = Vec::new();
+    let mut fence_lines: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    let mut fence_lang = String::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        let marker = line.trim_start();
+        if marker.starts_with("```") {
+            if in_fence {
+                emit_code_fence(&mut events, &fence_lang, &fence_lines);
+                fence_lines.clear();
+                in_fence = false;
+                fence_lang.clear();
+            } else {
+                emit_prose_block(&mut events, &prose_lines);
+                prose_lines.clear();
+                in_fence = true;
+                fence_lang = marker.trim_start_matches("```").trim().to_string();
+            }
+            continue;
+        }
+
+        if in_fence {
+            fence_lines.push(line.to_string());
+        } else {
+            prose_lines.push(line.to_string());
+        }
+    }
+
+    if in_fence {
+        emit_code_fence(&mut events, &fence_lang, &fence_lines);
+    } else {
+        emit_prose_block(&mut events, &prose_lines);
+    }
+
+    if events.is_empty() {
+        events.push(DisplayEvent::Line(
+            LogStream::Stdout,
+            "agent: (empty message)".to_string(),
+        ));
+    }
+    events
+}
+
+fn emit_prose_block(events: &mut Vec<DisplayEvent>, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let non_empty: Vec<String> = lines
+        .iter()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return;
+    }
+
+    if looks_like_diff_block(&non_empty) {
+        for line in non_empty {
+            events.push(DisplayEvent::Line(
+                LogStream::Stdout,
+                format!("diff| {line}"),
+            ));
+        }
+        return;
+    }
+
+    for line in non_empty {
+        events.push(DisplayEvent::Line(
+            LogStream::Stdout,
+            format!("agent: {}", summarize_text(&line, 220)),
+        ));
+    }
+}
+
+fn emit_code_fence(events: &mut Vec<DisplayEvent>, lang: &str, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let content = lines.join("\n");
+    let lang_lower = lang.trim().to_ascii_lowercase();
+
+    if lang_lower == "json" || lang_lower == "jsonc" {
+        if let Ok(value) = serde_json::from_str::<Value>(&content) {
+            events.push(DisplayEvent::Line(LogStream::Stdout, "json: block".to_string()));
+            if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+                for line in pretty.lines() {
+                    events.push(DisplayEvent::Line(
+                        LogStream::Stdout,
+                        format!("json| {line}"),
+                    ));
+                }
+                return;
+            }
+        }
+    }
+
+    if lang_lower.contains("diff")
+        || lang_lower.contains("patch")
+        || looks_like_diff_block(lines)
+    {
+        for line in lines {
+            events.push(DisplayEvent::Line(
+                LogStream::Stdout,
+                format!("diff| {line}"),
+            ));
+        }
+        return;
+    }
+
+    let code_header = if lang.trim().is_empty() {
+        "code: block".to_string()
+    } else {
+        format!("code: {}", lang.trim())
+    };
+    events.push(DisplayEvent::Line(LogStream::Stdout, code_header));
+    for line in lines {
+        events.push(DisplayEvent::Line(
+            LogStream::Stdout,
+            format!("code| {line}"),
+        ));
+    }
+}
+
+fn looks_like_diff_block(lines: &[String]) -> bool {
+    if lines.is_empty() {
+        return false;
+    }
+
+    let mut score = 0usize;
+    for line in lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("diff --git")
+            || trimmed.starts_with("@@")
+            || trimmed.starts_with("--- ")
+            || trimmed.starts_with("+++ ")
+            || trimmed.starts_with("index ")
+        {
+            score += 2;
+            continue;
+        }
+        if trimmed.starts_with('+') || trimmed.starts_with('-') {
+            score += 1;
+        }
+    }
+    score >= 3
 }
 
 fn summarize_text(text: &str, max_len: usize) -> String {
@@ -1568,6 +1775,54 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             DisplayEvent::AgentStatus(status) if status == "Responding"
+        )));
+    }
+
+    #[test]
+    fn codex_agent_message_formats_json_and_code_blocks() {
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let events = formatter.format(
+            LogStream::Stdout,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Here is data:\n```json\n{\"ok\":true,\"count\":2}\n```\nAnd code:\n```rust\nfn main() {}\n```"}}"#,
+        );
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DisplayEvent::Line(LogStream::Stdout, line) if line == "agent: Here is data:"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DisplayEvent::Line(LogStream::Stdout, line) if line.starts_with("json| {")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DisplayEvent::Line(LogStream::Stdout, line) if line == "code: rust"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DisplayEvent::Line(LogStream::Stdout, line) if line.contains("code| fn main() {}")
+        )));
+    }
+
+    #[test]
+    fn codex_agent_message_formats_diff_blocks() {
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let events = formatter.format(
+            LogStream::Stdout,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"```diff\n@@ -1 +1 @@\n-old\n+new\n```"}}"#,
+        );
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DisplayEvent::Line(LogStream::Stdout, line) if line == "diff| @@ -1 +1 @@"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DisplayEvent::Line(LogStream::Stdout, line) if line == "diff| -old"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DisplayEvent::Line(LogStream::Stdout, line) if line == "diff| +new"
         )));
     }
 
