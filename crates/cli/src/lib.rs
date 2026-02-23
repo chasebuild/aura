@@ -1,12 +1,14 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use aura_contracts::ExecutorKind;
 use aura_executors::adapters::{
     AmpOptions, ClaudeOptions, CodexOptions, CopilotOptions, CursorAgentOptions, DroidOptions,
-    GeminiOptions, OpencodeOptions, QwenCodeOptions,
+    GeminiOptions, LocalOptions, OpencodeOptions, QwenCodeOptions,
 };
 use aura_executors::{
     AppendPrompt, CmdOverrides, ExecutionEnv, ExecutorError, ExecutorProfileId, RepoContext,
@@ -27,7 +29,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -44,6 +46,7 @@ pub struct RunOptions {
     pub additional_params: Vec<String>,
     pub append_prompt: Option<String>,
     pub model: Option<String>,
+    pub openai_endpoint: Option<String>,
     pub yolo: bool,
     pub force: bool,
     pub trust: bool,
@@ -65,6 +68,7 @@ impl Default for RunOptions {
             additional_params: Vec::new(),
             append_prompt: None,
             model: None,
+            openai_endpoint: None,
             yolo: false,
             force: false,
             trust: false,
@@ -788,7 +792,7 @@ pub enum CliCommand {
 }
 
 pub fn usage() -> &'static str {
-    "Usage:\n  aura run --executor <name> --prompt <text> [options]\n  aura tui --executor <name> --prompt <text> [options]\n  aura help\n\nExecutors:\n  codex | claude | cursor-agent | droid | amp | gemini | opencode | qwen-code | copilot | custom\n\nOptions:\n  --cwd <path>\n  --session <id>\n  --review\n  --var KEY=VALUE      (repeatable)\n  --base-command <cmd>\n  --param <arg>        (repeatable)\n  --append-prompt <text>\n  --model <name>\n  --yolo\n  --force | -f\n  --trust\n  --auto-approve <true|false>\n  --allow-all-tools\n  --no-tui\n"
+    "Usage:\n  aura run --executor <name> --prompt <text> [options]\n  aura tui --executor <name> --prompt <text> [options]\n  aura help\n\nExecutors:\n  codex | claude | cursor-agent | droid | amp | gemini | opencode | local | qwen-code | copilot | custom\n\nOptions:\n  --cwd <path>\n  --session <id>\n  --review\n  --var KEY=VALUE      (repeatable)\n  --base-command <cmd>\n  --param <arg>        (repeatable)\n  --append-prompt <text>\n  --model <name>\n  --openai-endpoint <url>  (local executor)\n  --yolo\n  --force | -f\n  --trust\n  --auto-approve <true|false>\n  --allow-all-tools\n  --no-tui\n"
 }
 
 pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, CliError> {
@@ -893,6 +897,16 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions, CliError> {
                         .clone(),
                 );
             }
+            "--openai-endpoint" => {
+                i += 1;
+                opts.openai_endpoint = Some(
+                    args.get(i)
+                        .ok_or_else(|| {
+                            CliError::Arg("missing value for --openai-endpoint".to_string())
+                        })?
+                        .clone(),
+                );
+            }
             "--yolo" => opts.yolo = true,
             "--force" | "-f" => opts.force = true,
             "--trust" => opts.trust = true,
@@ -936,6 +950,7 @@ fn parse_executor(raw: &str) -> Result<ExecutorKind, CliError> {
         "amp" => Ok(ExecutorKind::Amp),
         "gemini" => Ok(ExecutorKind::Gemini),
         "opencode" => Ok(ExecutorKind::Opencode),
+        "local" => Ok(ExecutorKind::Local),
         "qwen" | "qwen-code" => Ok(ExecutorKind::QwenCode),
         "copilot" => Ok(ExecutorKind::Copilot),
         "custom" => Ok(ExecutorKind::Custom("custom".to_string())),
@@ -971,6 +986,7 @@ fn model_options_for_executor(executor: &ExecutorKind) -> Vec<String> {
             "claude-sonnet-4-5".to_string(),
             "gemini-2.5-pro".to_string(),
         ],
+        ExecutorKind::Local => discover_local_model_options(),
         ExecutorKind::QwenCode => vec!["qwen3-coder-plus".to_string(), "qwen3-coder".to_string()],
         ExecutorKind::Copilot => vec![
             "gpt-4.1".to_string(),
@@ -982,7 +998,353 @@ fn model_options_for_executor(executor: &ExecutorKind) -> Vec<String> {
     }
 }
 
+fn discover_local_model_options() -> Vec<String> {
+    let mut options = Vec::new();
+    let mut seen = HashSet::new();
+
+    for model in discover_ollama_models() {
+        let value = format!("ollama/{model}");
+        if seen.insert(value.clone()) {
+            options.push(value);
+        }
+    }
+
+    for model in discover_lmstudio_models() {
+        let value = format!("lmstudio/{model}");
+        if seen.insert(value.clone()) {
+            options.push(value);
+        }
+    }
+
+    options
+}
+
+fn discover_ollama_models() -> Vec<String> {
+    let output = read_command_output("ollama", &["list"])
+        .or_else(|| read_command_output("ollama", &["ls"]))
+        .unwrap_or_default();
+    parse_ollama_models(&output)
+}
+
+fn discover_lmstudio_models() -> Vec<String> {
+    let output = read_command_output(
+        "curl",
+        &[
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--max-time",
+            "1",
+            "http://127.0.0.1:1234/v1/models",
+        ],
+    )
+    .unwrap_or_default();
+    parse_lmstudio_models(&output)
+}
+
+fn read_command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn parse_ollama_models(raw: &str) -> Vec<String> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with('{')
+            && let Ok(value) = serde_json::from_str::<Value>(trimmed)
+            && let Some(name) = value
+                .get("name")
+                .or_else(|| value.get("model"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+        {
+            let candidate = name.to_string();
+            if seen.insert(candidate.clone()) {
+                models.push(candidate);
+            }
+            continue;
+        }
+
+        let first = trimmed.split_whitespace().next().unwrap_or_default();
+        if first.is_empty() || first.eq_ignore_ascii_case("name") {
+            continue;
+        }
+        let candidate = first.trim().to_string();
+        if seen.insert(candidate.clone()) {
+            models.push(candidate);
+        }
+    }
+
+    models
+}
+
+fn parse_lmstudio_models(raw: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(data) = value.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for item in data {
+        let Some(model_id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let candidate = model_id.to_string();
+        if seen.insert(candidate.clone()) {
+            models.push(candidate);
+        }
+    }
+    models
+}
+
+fn resolve_local_model_and_endpoint(
+    model: Option<&str>,
+    openai_endpoint: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let explicit_endpoint = openai_endpoint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let selected_model = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let Some(selected_model) = selected_model else {
+        return (None, explicit_endpoint);
+    };
+
+    let (normalized_model, inferred_endpoint) =
+        if let Some(model_name) = selected_model.strip_prefix("ollama/") {
+            (
+                Some(model_name.to_string()),
+                Some("http://127.0.0.1:11434/v1".to_string()),
+            )
+        } else if let Some(model_name) = selected_model.strip_prefix("lmstudio/") {
+            (
+                Some(model_name.to_string()),
+                Some("http://127.0.0.1:1234".to_string()),
+            )
+        } else {
+            (Some(selected_model), None)
+        };
+
+    (normalized_model, explicit_endpoint.or(inferred_endpoint))
+}
+
+pub async fn run_local_exec_from_env() -> i32 {
+    let prompt = std::env::var("AURA_PROMPT").unwrap_or_default();
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        eprintln!("local executor: empty prompt");
+        return 1;
+    }
+
+    let model = std::env::var("AURA_LOCAL_MODEL").unwrap_or_default();
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        eprintln!("local executor: model is required; pass --model");
+        return 1;
+    }
+
+    let base_url = normalize_openai_base_url(
+        std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .or_else(|| std::env::var("OPENAI_API_BASE").ok()),
+    );
+    let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "local".to_string());
+    let session_id = std::env::var("AURA_SESSION_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let mut history = match &session_id {
+        Some(id) => load_local_session_history(id),
+        None => Vec::new(),
+    };
+    history.push(json!({
+        "role": "user",
+        "content": prompt
+    }));
+
+    let payload = json!({
+        "model": model,
+        "messages": history,
+        "stream": false
+    });
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("local executor: failed to build HTTP client: {error}");
+            return 1;
+        }
+    };
+
+    let response = match client
+        .post(openai_chat_completions_url(&base_url))
+        .bearer_auth(api_key)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("local executor: request failed: {error}");
+            return 1;
+        }
+    };
+
+    let status = response.status();
+    let raw_body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            eprintln!("local executor: failed to read response body: {error}");
+            return 1;
+        }
+    };
+
+    if !status.is_success() {
+        eprintln!(
+            "local executor: request failed ({status}): {}",
+            summarize_text(&raw_body, 400)
+        );
+        return 1;
+    }
+
+    let parsed: Value = match serde_json::from_str(&raw_body) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("local executor: invalid JSON response: {error}");
+            eprintln!("{}", summarize_text(&raw_body, 400));
+            return 1;
+        }
+    };
+
+    let content = match extract_openai_message_content(&parsed) {
+        Some(content) if !content.trim().is_empty() => content,
+        _ => {
+            eprintln!("local executor: empty response content");
+            return 1;
+        }
+    };
+
+    for line in content.lines() {
+        println!("agent: {line}");
+    }
+
+    if let Some(id) = session_id {
+        history.push(json!({
+            "role": "assistant",
+            "content": content
+        }));
+        save_local_session_history(&id, &history);
+    }
+
+    0
+}
+
+fn normalize_openai_base_url(value: Option<String>) -> String {
+    let value = value.unwrap_or_else(|| "http://127.0.0.1:1234".to_string());
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        "http://127.0.0.1:1234".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn openai_chat_completions_url(base_url: &str) -> String {
+    if base_url.ends_with("/v1") {
+        format!("{base_url}/chat/completions")
+    } else {
+        format!("{base_url}/v1/chat/completions")
+    }
+}
+
+fn extract_openai_message_content(value: &Value) -> Option<String> {
+    let first = value.get("choices")?.as_array()?.first()?;
+    let message = first.get("message")?;
+    let content = message.get("content")?;
+    match content {
+        Value::String(text) => Some(text.to_string()),
+        Value::Array(parts) => {
+            let text_parts = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>();
+            if text_parts.is_empty() {
+                None
+            } else {
+                Some(text_parts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn local_session_file(session_id: &str) -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".aura")
+        .join("local_sessions")
+        .join(format!("{session_id}.json"))
+}
+
+fn load_local_session_history(session_id: &str) -> Vec<Value> {
+    let path = local_session_file(session_id);
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(history) = serde_json::from_str::<Vec<Value>>(&raw) else {
+        return Vec::new();
+    };
+    history
+}
+
+fn save_local_session_history(session_id: &str, history: &[Value]) {
+    let path = local_session_file(session_id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let keep_from = history.len().saturating_sub(20);
+    let trimmed = &history[keep_from..];
+    if let Ok(serialized) = serde_json::to_string(trimmed) {
+        let _ = fs::write(path, serialized);
+    }
+}
+
 pub async fn run_with_default_sink(options: RunOptions) -> Result<RunOutcome, CliError> {
+    let mut options = options;
+    ensure_local_model_selected(&mut options)?;
     let use_tui = options.tui && io::stdout().is_terminal();
     if use_tui {
         let mut sink = TuiLogSink::new();
@@ -997,6 +1359,8 @@ pub async fn run_executor(
     options: RunOptions,
     sink: &mut dyn LogSink,
 ) -> Result<RunOutcome, CliError> {
+    let mut options = options;
+    ensure_local_model_selected(&mut options)?;
     run_executor_inner(options, sink, false).await
 }
 
@@ -1039,6 +1403,75 @@ async fn run_tui_session(
                 return Ok(outcome);
             }
         }
+    }
+}
+
+fn ensure_local_model_selected(options: &mut RunOptions) -> Result<(), CliError> {
+    if !matches!(options.executor, ExecutorKind::Local) {
+        return Ok(());
+    }
+    if options
+        .model
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Ok(());
+    }
+
+    let models = discover_local_model_options();
+    if models.is_empty() {
+        return Err(CliError::Arg(
+            "no local models discovered from Ollama or LM Studio; pass --model explicitly"
+                .to_string(),
+        ));
+    }
+    options.model = Some(prompt_for_local_model_selection(&models)?);
+    Ok(())
+}
+
+fn prompt_for_local_model_selection(models: &[String]) -> Result<String, CliError> {
+    let default = models
+        .first()
+        .cloned()
+        .ok_or_else(|| CliError::Arg("no local models available".to_string()))?;
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(default);
+    }
+
+    let mut stdout = io::stdout();
+    writeln!(
+        stdout,
+        "[aura] local executor requires a model. Select one (default: 1)."
+    )?;
+    for (index, model) in models.iter().enumerate() {
+        let suffix = if index == 0 { " (default)" } else { "" };
+        writeln!(stdout, "  {}. {}{}", index + 1, model, suffix)?;
+    }
+    write!(stdout, "Selection [1-{}] (Enter=1): ", models.len())?;
+    stdout.flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let selected_index = parse_model_selection_input(&input, models.len())
+        .ok_or_else(|| CliError::Arg(format!("invalid model selection: {}", input.trim())))?;
+    Ok(models[selected_index].clone())
+}
+
+fn parse_model_selection_input(input: &str, option_count: usize) -> Option<usize> {
+    if option_count == 0 {
+        return None;
+    }
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Some(0);
+    }
+    let selected = trimmed.parse::<usize>().ok()?;
+    if (1..=option_count).contains(&selected) {
+        Some(selected - 1)
+    } else {
+        None
     }
 }
 
@@ -1158,6 +1591,24 @@ fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> 
             auto_approve: options.auto_approve,
             cmd_overrides,
         })),
+        ExecutorKind::Local => {
+            let mut local_cmd_overrides = cmd_overrides;
+            if local_cmd_overrides.base_command_override.is_none() {
+                local_cmd_overrides.base_command_override = std::env::current_exe()
+                    .ok()
+                    .map(|path| path.display().to_string());
+            }
+            let (model, openai_endpoint) = resolve_local_model_and_endpoint(
+                options.model.as_deref(),
+                options.openai_endpoint.as_deref(),
+            );
+            Box::new(adapters::local(LocalOptions {
+                append_prompt,
+                model,
+                openai_endpoint,
+                cmd_overrides: local_cmd_overrides,
+            }))
+        }
         ExecutorKind::QwenCode => Box::new(adapters::qwen_code(QwenCodeOptions {
             append_prompt,
             yolo: options.yolo,
@@ -1982,6 +2433,118 @@ mod tests {
     }
 
     #[test]
+    fn parses_local_executor() {
+        let args = vec![
+            "run".to_string(),
+            "--executor".to_string(),
+            "local".to_string(),
+            "--prompt".to_string(),
+            "hi".to_string(),
+        ];
+
+        let parsed = parse_cli_args(&args).expect("parse");
+        match parsed {
+            CliCommand::Run(opts) => {
+                assert!(matches!(opts.executor, ExecutorKind::Local));
+                assert_eq!(opts.prompt, "hi");
+            }
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn parses_local_openai_endpoint() {
+        let args = vec![
+            "run".to_string(),
+            "--executor".to_string(),
+            "local".to_string(),
+            "--prompt".to_string(),
+            "hi".to_string(),
+            "--openai-endpoint".to_string(),
+            "http://127.0.0.1:1234".to_string(),
+        ];
+
+        let parsed = parse_cli_args(&args).expect("parse");
+        match parsed {
+            CliCommand::Run(opts) => {
+                assert_eq!(
+                    opts.openai_endpoint.as_deref(),
+                    Some("http://127.0.0.1:1234")
+                );
+            }
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn local_model_resolution_strips_prefix_and_infers_endpoint() {
+        let (model, endpoint) = resolve_local_model_and_endpoint(Some("lmstudio/qwen2.5"), None);
+        assert_eq!(model.as_deref(), Some("qwen2.5"));
+        assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:1234"));
+
+        let (model, endpoint) = resolve_local_model_and_endpoint(Some("ollama/llama3.2:3b"), None);
+        assert_eq!(model.as_deref(), Some("llama3.2:3b"));
+        assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:11434/v1"));
+
+        let (model, endpoint) = resolve_local_model_and_endpoint(
+            Some("lmstudio/qwen2.5"),
+            Some("http://localhost:9999"),
+        );
+        assert_eq!(model.as_deref(), Some("qwen2.5"));
+        assert_eq!(endpoint.as_deref(), Some("http://localhost:9999"));
+    }
+
+    #[test]
+    fn parses_local_model_selection_input() {
+        assert_eq!(parse_model_selection_input("", 3), Some(0));
+        assert_eq!(parse_model_selection_input("2", 3), Some(1));
+        assert_eq!(parse_model_selection_input("0", 3), None);
+        assert_eq!(parse_model_selection_input("4", 3), None);
+        assert_eq!(parse_model_selection_input("abc", 3), None);
+    }
+
+    #[test]
+    fn builds_openai_chat_completion_url() {
+        assert_eq!(
+            openai_chat_completions_url("http://127.0.0.1:1234"),
+            "http://127.0.0.1:1234/v1/chat/completions"
+        );
+        assert_eq!(
+            openai_chat_completions_url("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn parses_ollama_models_from_table_output() {
+        let input = r#"
+NAME                  ID              SIZE      MODIFIED
+llama3.2:3b           abcdef          2.0 GB    2 hours ago
+qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
+"#;
+
+        let models = parse_ollama_models(input);
+        assert_eq!(models, vec!["llama3.2:3b", "qwen2.5-coder:7b"]);
+    }
+
+    #[test]
+    fn parses_lmstudio_models_from_openai_models_payload() {
+        let input = r#"{
+  "object": "list",
+  "data": [
+    {"id": "qwen2.5-coder-7b-instruct"},
+    {"id": "llama-3.1-8b-instruct"}
+  ]
+}"#;
+
+        let models = parse_lmstudio_models(input);
+        assert_eq!(
+            models,
+            vec!["qwen2.5-coder-7b-instruct", "llama-3.1-8b-instruct"]
+        );
+    }
+
+    #[test]
     fn quit_key_mapping() {
         assert!(is_quit_key(KeyEvent::new(
             KeyCode::Char('q'),
@@ -2216,6 +2779,7 @@ mod tests {
             ],
             append_prompt: None,
             model: None,
+            openai_endpoint: None,
             yolo: false,
             force: false,
             trust: false,
@@ -2248,6 +2812,7 @@ mod tests {
             ],
             append_prompt: None,
             model: None,
+            openai_endpoint: None,
             yolo: false,
             force: false,
             trust: false,
@@ -2275,6 +2840,7 @@ mod tests {
             additional_params: Vec::new(),
             append_prompt: None,
             model: None,
+            openai_endpoint: None,
             yolo: true,
             force: false,
             trust: false,

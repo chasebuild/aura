@@ -78,6 +78,7 @@ pub enum ExecutorKind {
     Codex,
     Claude,
     Opencode,
+    Local,
     QwenCode,
     Copilot,
     CursorAgent,

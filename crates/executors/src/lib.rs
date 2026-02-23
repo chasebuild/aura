@@ -705,12 +705,14 @@ mod tests {
     fn adapters_cover_reference_providers() {
         let amp = adapters::amp_default();
         let gemini = adapters::gemini_default();
+        let local = adapters::local_default();
         let opencode = adapters::opencode_default();
         let qwen = adapters::qwen_code_default();
         let copilot = adapters::copilot_default();
 
         assert!(matches!(amp.profile_id().executor, ExecutorKind::Amp));
         assert!(matches!(gemini.profile_id().executor, ExecutorKind::Gemini));
+        assert!(matches!(local.profile_id().executor, ExecutorKind::Local));
         assert!(matches!(
             opencode.profile_id().executor,
             ExecutorKind::Opencode

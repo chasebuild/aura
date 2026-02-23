@@ -9,6 +9,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 ### Changed
 
 - Updated project documentation across `README.md`, `CONTRIBUTING.md`, and `CHANGELOG.md`.
+- Added a Rust-native `local` executor with local model discovery from Ollama and LM Studio, configurable OpenAI-compatible endpoint support, and interactive model selection when `--model` is omitted.
 
 ## [0.1.0] - 2026-02-23
 

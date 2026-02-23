@@ -247,6 +247,7 @@ fn executor_display_name(executor: &ExecutorKind) -> String {
         ExecutorKind::Codex => "codex".to_string(),
         ExecutorKind::Claude => "claude".to_string(),
         ExecutorKind::Opencode => "opencode".to_string(),
+        ExecutorKind::Local => "local".to_string(),
         ExecutorKind::QwenCode => "qwen-code".to_string(),
         ExecutorKind::Copilot => "copilot".to_string(),
         ExecutorKind::CursorAgent => "cursor-agent".to_string(),

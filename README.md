@@ -54,6 +54,7 @@ Executors:
 | `amp`          | Sourcegraph Amp adapter (`npx`) in execute + stream-json mode, with optional broad tool permission mode.       |
 | `gemini`       | Google Gemini CLI adapter (`npx`) with ACP mode, optional model selection, and optional yolo tooling flag.     |
 | `opencode`     | OpenCode AI adapter (`npx`) with configurable model/variant/agent mode and host/port/env overrides.            |
+| `local`        | Rust-native local adapter for OpenAI-compatible local endpoints, with model discovery from Ollama and LM Studio. |
 | `qwen-code`    | Qwen Code adapter (`npx`) in ACP mode with optional yolo execution behavior.                                   |
 | `copilot`      | GitHub Copilot CLI adapter (`npx`) with tool allow/deny controls and optional model selection.                 |
 | `custom`       | Generic command-backed executor where you provide the base command and params directly.                        |
@@ -68,12 +69,15 @@ Key options:
 - `--param <arg>` (repeatable)
 - `--append-prompt <text>`
 - `--model <name>`
+- `--openai-endpoint <url>` (for `local` executor)
 - `--yolo`
 - `--force` / `-f`
 - `--trust`
 - `--auto-approve <true|false>`
 - `--allow-all-tools`
 - `--no-tui`
+
+For `--executor local`, if `--model` is omitted, the CLI prompts you to select from discovered local models (default is the first discovered model).
 
 ## Workspace Crates
 
