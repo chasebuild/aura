@@ -40,6 +40,7 @@ cargo run -p aura-cli -- run --executor custom --prompt "ignored" --base-command
 Usage:
   aura run --executor <name> --prompt <text> [options]
   aura tui --executor <name> --prompt <text> [options]
+  aura completion <shell>
   aura help
 ```
 
@@ -78,6 +79,8 @@ Key options:
 - `--no-tui`
 
 For `--executor local`, if `--model` is omitted, the CLI prompts you to select from discovered local models (default is the first discovered model).
+
+Shell completion scripts can be generated with `aura completion bash|zsh|fish|powershell|elvish`.
 
 ## Workspace Crates
 

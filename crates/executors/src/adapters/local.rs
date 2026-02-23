@@ -6,6 +6,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct LocalOptions {
     pub append_prompt: AppendPrompt,
     pub model: Option<String>,
@@ -13,16 +14,6 @@ pub struct LocalOptions {
     pub cmd_overrides: CmdOverrides,
 }
 
-impl Default for LocalOptions {
-    fn default() -> Self {
-        Self {
-            append_prompt: AppendPrompt::default(),
-            model: None,
-            openai_endpoint: None,
-            cmd_overrides: CmdOverrides::default(),
-        }
-    }
-}
 
 pub fn local(options: LocalOptions) -> CommandBackedExecutor {
     let params = vec!["local-exec".to_string()];

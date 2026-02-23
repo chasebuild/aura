@@ -1,12 +1,11 @@
-use aura_cli::{CliCommand, parse_cli_args, run_local_exec_from_env, run_with_default_sink, usage};
+use aura_cli::{
+    CliCommand, completion_script, parse_cli_args, run_local_exec_from_env, run_with_default_sink,
+    usage,
+};
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), Some("local-exec")) {
-        std::process::exit(run_local_exec_from_env().await);
-    }
-
     let command = match parse_cli_args(&args) {
         Ok(command) => command,
         Err(err) => {
@@ -20,6 +19,12 @@ async fn main() {
     match command {
         CliCommand::Help => {
             println!("{}", usage());
+        }
+        CliCommand::Completion { shell } => {
+            println!("{}", completion_script(shell));
+        }
+        CliCommand::LocalExec => {
+            std::process::exit(run_local_exec_from_env().await);
         }
         CliCommand::Run(options) => match run_with_default_sink(options).await {
             Ok(outcome) => {

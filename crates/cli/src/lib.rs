@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use aura_contracts::ExecutorKind;
@@ -15,12 +14,15 @@ use aura_executors::{
     SpawnedChild, StandardCodingAgentExecutor, adapters,
 };
 use aura_usage::UsageTracker;
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 use crossterm::{
     cursor::Show,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use duct::cmd;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -297,7 +299,7 @@ fn classify_tui_line(stream: LogStream, line: &str) -> TuiLineKind {
 }
 
 fn normalize_tui_line_text(kind: TuiLineKind, line: &str) -> String {
-    match kind {
+    let normalized = match kind {
         TuiLineKind::User => line.trim_start_matches("user: ").to_string(),
         TuiLineKind::Agent => line.trim_start_matches("agent: ").to_string(),
         TuiLineKind::Code => line
@@ -309,11 +311,63 @@ fn normalize_tui_line_text(kind: TuiLineKind, line: &str) -> String {
             .trim_start_matches("json| ")
             .to_string(),
         TuiLineKind::Diff => line.trim_start_matches("diff| ").to_string(),
-        TuiLineKind::Thinking => line.trim_start_matches("thinking: ").to_string(),
+        TuiLineKind::Thinking => normalize_thinking_text(line.trim_start_matches("thinking: ")),
         TuiLineKind::Action => line.to_string(),
         TuiLineKind::Error => line.to_string(),
         TuiLineKind::Output => line.to_string(),
+    };
+    sanitize_tui_text(&normalized)
+}
+
+fn normalize_thinking_text(text: &str) -> String {
+    text.replace("**", "").replace("__", "")
+}
+
+fn sanitize_tui_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek().copied() {
+                // CSI: ESC [ ... <final-byte>
+                Some('[') => {
+                    let _ = chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] ... BEL or ESC \
+                Some(']') => {
+                    let _ = chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && matches!(chars.peek(), Some('\\')) {
+                            let _ = chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    let _ = chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            _ => out.push(ch),
+        }
     }
+
+    out
 }
 
 impl TuiLogSink {
@@ -412,11 +466,11 @@ impl TuiLogSink {
                         Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     ]),
                     TuiLineKind::Agent => Line::from(vec![
-                        Span::styled(" AGENT ", Style::default().fg(Color::White).bg(Color::Cyan)),
+                        Span::styled(" AGENT ", Style::default().fg(Color::White).bg(Color::Black)),
                         Span::raw(" "),
-                        Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-                        Span::styled(entry.text, Style::default().fg(Color::Black).bg(Color::Cyan)),
-                        Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+                        Span::styled(" ", Style::default().fg(Color::White).bg(Color::Black)),
+                        Span::styled(entry.text, Style::default().fg(Color::White).bg(Color::Black)),
+                        Span::styled(" ", Style::default().fg(Color::White).bg(Color::Black)),
                     ]),
                     TuiLineKind::Code => Line::from(vec![
                         Span::styled(
@@ -663,6 +717,9 @@ impl TuiLogSink {
     }
 
     fn push_log_entry(&mut self, kind: TuiLineKind, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
         if self.log_scroll > 0 {
             self.log_scroll = self.log_scroll.saturating_add(1);
         }
@@ -789,172 +846,172 @@ impl Drop for TuiLogSink {
 pub enum CliCommand {
     Run(RunOptions),
     Help,
+    Completion { shell: Shell },
+    LocalExec,
 }
 
-pub fn usage() -> &'static str {
-    "Usage:\n  aura run --executor <name> --prompt <text> [options]\n  aura tui --executor <name> --prompt <text> [options]\n  aura help\n\nExecutors:\n  codex | claude | cursor-agent | droid | amp | gemini | opencode | local | qwen-code | copilot | custom\n\nOptions:\n  --cwd <path>\n  --session <id>\n  --review\n  --var KEY=VALUE      (repeatable)\n  --base-command <cmd>\n  --param <arg>        (repeatable)\n  --append-prompt <text>\n  --model <name>\n  --openai-endpoint <url>  (local executor)\n  --yolo\n  --force | -f\n  --trust\n  --auto-approve <true|false>\n  --allow-all-tools\n  --no-tui\n"
+#[derive(Debug, Parser)]
+#[command(
+    name = "aura",
+    version,
+    about = "AURA executor runner",
+    disable_help_subcommand = true
+)]
+struct AuraCli {
+    #[command(subcommand)]
+    command: Option<AuraSubcommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuraSubcommand {
+    Run(RunCliArgs),
+    Tui(RunCliArgs),
+    Help,
+    Completion(CompletionArgs),
+    #[command(name = "local-exec", hide = true)]
+    LocalExec,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExecutorArg {
+    Codex,
+    Claude,
+    #[value(name = "cursor-agent", alias = "cursor")]
+    CursorAgent,
+    Droid,
+    Amp,
+    Gemini,
+    Opencode,
+    Local,
+    #[value(name = "qwen-code", alias = "qwen")]
+    QwenCode,
+    Copilot,
+    Custom,
+}
+
+#[derive(Debug, Args)]
+struct CompletionArgs {
+    #[arg(value_enum)]
+    shell: Shell,
+}
+
+#[derive(Debug, Args)]
+struct RunCliArgs {
+    #[arg(long, value_enum, default_value_t = ExecutorArg::Codex)]
+    executor: ExecutorArg,
+    #[arg(long)]
+    prompt: String,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long = "session")]
+    session_id: Option<String>,
+    #[arg(long)]
+    review: bool,
+    #[arg(long = "var", value_name = "KEY=VALUE")]
+    env_vars: Vec<String>,
+    #[arg(long = "base-command")]
+    base_command_override: Option<String>,
+    #[arg(long = "param", allow_hyphen_values = true)]
+    additional_params: Vec<String>,
+    #[arg(long = "append-prompt")]
+    append_prompt: Option<String>,
+    #[arg(long = "model")]
+    model: Option<String>,
+    #[arg(long = "openai-endpoint")]
+    openai_endpoint: Option<String>,
+    #[arg(long)]
+    yolo: bool,
+    #[arg(long, short = 'f')]
+    force: bool,
+    #[arg(long)]
+    trust: bool,
+    #[arg(long = "auto-approve")]
+    auto_approve: Option<bool>,
+    #[arg(long = "allow-all-tools")]
+    allow_all_tools: bool,
+    #[arg(long = "no-tui")]
+    no_tui: bool,
+}
+
+fn executor_kind_from_arg(value: ExecutorArg) -> ExecutorKind {
+    match value {
+        ExecutorArg::Codex => ExecutorKind::Codex,
+        ExecutorArg::Claude => ExecutorKind::Claude,
+        ExecutorArg::CursorAgent => ExecutorKind::CursorAgent,
+        ExecutorArg::Droid => ExecutorKind::Droid,
+        ExecutorArg::Amp => ExecutorKind::Amp,
+        ExecutorArg::Gemini => ExecutorKind::Gemini,
+        ExecutorArg::Opencode => ExecutorKind::Opencode,
+        ExecutorArg::Local => ExecutorKind::Local,
+        ExecutorArg::QwenCode => ExecutorKind::QwenCode,
+        ExecutorArg::Copilot => ExecutorKind::Copilot,
+        ExecutorArg::Custom => ExecutorKind::Custom("custom".to_string()),
+    }
+}
+
+fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions, CliError> {
+    let mut env_vars = HashMap::new();
+    for pair in args.env_vars {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next().unwrap_or("").trim();
+        let value = parts.next().unwrap_or("").to_string();
+        if key.is_empty() {
+            return Err(CliError::Arg("--var expects KEY=VALUE format".to_string()));
+        }
+        env_vars.insert(key.to_string(), value);
+    }
+
+    Ok(RunOptions {
+        executor: executor_kind_from_arg(args.executor),
+        prompt: args.prompt,
+        cwd: args
+            .cwd
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        session_id: args.session_id,
+        review: args.review,
+        env_vars,
+        base_command_override: args.base_command_override,
+        additional_params: args.additional_params,
+        append_prompt: args.append_prompt,
+        model: args.model,
+        openai_endpoint: args.openai_endpoint,
+        yolo: args.yolo,
+        force: args.force,
+        trust: args.trust,
+        auto_approve: args.auto_approve.unwrap_or(true),
+        allow_all_tools: args.allow_all_tools,
+        tui: if force_tui { true } else { !args.no_tui },
+    })
+}
+
+pub fn usage() -> String {
+    let mut cmd = AuraCli::command();
+    let mut output = Vec::new();
+    let _ = cmd.write_long_help(&mut output);
+    String::from_utf8_lossy(&output).to_string()
+}
+
+pub fn completion_script(shell: Shell) -> String {
+    let mut cmd = AuraCli::command();
+    let mut output = Vec::new();
+    generate(shell, &mut cmd, "aura", &mut output);
+    String::from_utf8_lossy(&output).to_string()
 }
 
 pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, CliError> {
-    if args.is_empty() {
-        return Ok(CliCommand::Help);
-    }
+    let argv = std::iter::once("aura".to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>();
+    let parsed = AuraCli::try_parse_from(argv).map_err(|error| CliError::Arg(error.to_string()))?;
 
-    match args[0].as_str() {
-        "help" | "--help" | "-h" => Ok(CliCommand::Help),
-        "run" => Ok(CliCommand::Run(parse_run_options(args)?)),
-        "tui" => {
-            let mut options = parse_run_options(args)?;
-            options.tui = true;
-            Ok(CliCommand::Run(options))
+    match parsed.command.unwrap_or(AuraSubcommand::Help) {
+        AuraSubcommand::Run(run_args) => {
+            Ok(CliCommand::Run(convert_run_cli_args(run_args, false)?))
         }
-        other => Err(CliError::Arg(format!("unknown command: {other}"))),
-    }
-}
-
-fn parse_run_options(args: &[String]) -> Result<RunOptions, CliError> {
-    let mut opts = RunOptions::default();
-    let mut i = 1;
-    while i < args.len() {
-        let key = &args[i];
-        match key.as_str() {
-            "--executor" => {
-                i += 1;
-                let value = args
-                    .get(i)
-                    .ok_or_else(|| CliError::Arg("missing value for --executor".to_string()))?;
-                opts.executor = parse_executor(value)?;
-            }
-            "--prompt" => {
-                i += 1;
-                opts.prompt = args
-                    .get(i)
-                    .ok_or_else(|| CliError::Arg("missing value for --prompt".to_string()))?
-                    .clone();
-            }
-            "--cwd" => {
-                i += 1;
-                opts.cwd = PathBuf::from(
-                    args.get(i)
-                        .ok_or_else(|| CliError::Arg("missing value for --cwd".to_string()))?,
-                );
-            }
-            "--session" => {
-                i += 1;
-                opts.session_id = Some(
-                    args.get(i)
-                        .ok_or_else(|| CliError::Arg("missing value for --session".to_string()))?
-                        .clone(),
-                );
-            }
-            "--review" => opts.review = true,
-            "--var" => {
-                i += 1;
-                let pair = args
-                    .get(i)
-                    .ok_or_else(|| CliError::Arg("missing value for --var".to_string()))?;
-                let mut parts = pair.splitn(2, '=');
-                let key = parts.next().unwrap_or("").trim();
-                let value = parts.next().unwrap_or("").to_string();
-                if key.is_empty() {
-                    return Err(CliError::Arg("--var expects KEY=VALUE format".to_string()));
-                }
-                opts.env_vars.insert(key.to_string(), value);
-            }
-            "--base-command" => {
-                i += 1;
-                opts.base_command_override = Some(
-                    args.get(i)
-                        .ok_or_else(|| {
-                            CliError::Arg("missing value for --base-command".to_string())
-                        })?
-                        .clone(),
-                );
-            }
-            "--param" => {
-                i += 1;
-                opts.additional_params.push(
-                    args.get(i)
-                        .ok_or_else(|| CliError::Arg("missing value for --param".to_string()))?
-                        .clone(),
-                );
-            }
-            "--append-prompt" => {
-                i += 1;
-                opts.append_prompt = Some(
-                    args.get(i)
-                        .ok_or_else(|| {
-                            CliError::Arg("missing value for --append-prompt".to_string())
-                        })?
-                        .clone(),
-                );
-            }
-            "--model" => {
-                i += 1;
-                opts.model = Some(
-                    args.get(i)
-                        .ok_or_else(|| CliError::Arg("missing value for --model".to_string()))?
-                        .clone(),
-                );
-            }
-            "--openai-endpoint" => {
-                i += 1;
-                opts.openai_endpoint = Some(
-                    args.get(i)
-                        .ok_or_else(|| {
-                            CliError::Arg("missing value for --openai-endpoint".to_string())
-                        })?
-                        .clone(),
-                );
-            }
-            "--yolo" => opts.yolo = true,
-            "--force" | "-f" => opts.force = true,
-            "--trust" => opts.trust = true,
-            "--allow-all-tools" => opts.allow_all_tools = true,
-            "--auto-approve" => {
-                i += 1;
-                let value = args
-                    .get(i)
-                    .ok_or_else(|| CliError::Arg("missing value for --auto-approve".to_string()))?;
-                opts.auto_approve = match value.as_str() {
-                    "true" => true,
-                    "false" => false,
-                    _ => {
-                        return Err(CliError::Arg(
-                            "--auto-approve expects true|false".to_string(),
-                        ));
-                    }
-                }
-            }
-            "--no-tui" => opts.tui = false,
-            other => {
-                return Err(CliError::Arg(format!("unknown argument: {other}")));
-            }
-        }
-        i += 1;
-    }
-
-    if opts.prompt.trim().is_empty() {
-        return Err(CliError::Arg("--prompt is required".to_string()));
-    }
-
-    Ok(opts)
-}
-
-fn parse_executor(raw: &str) -> Result<ExecutorKind, CliError> {
-    match raw.to_ascii_lowercase().as_str() {
-        "codex" => Ok(ExecutorKind::Codex),
-        "claude" => Ok(ExecutorKind::Claude),
-        "cursor" | "cursor-agent" => Ok(ExecutorKind::CursorAgent),
-        "droid" => Ok(ExecutorKind::Droid),
-        "amp" => Ok(ExecutorKind::Amp),
-        "gemini" => Ok(ExecutorKind::Gemini),
-        "opencode" => Ok(ExecutorKind::Opencode),
-        "local" => Ok(ExecutorKind::Local),
-        "qwen" | "qwen-code" => Ok(ExecutorKind::QwenCode),
-        "copilot" => Ok(ExecutorKind::Copilot),
-        "custom" => Ok(ExecutorKind::Custom("custom".to_string())),
-        _ => Err(CliError::Arg(format!("unsupported executor: {raw}"))),
+        AuraSubcommand::Tui(run_args) => Ok(CliCommand::Run(convert_run_cli_args(run_args, true)?)),
+        AuraSubcommand::Help => Ok(CliCommand::Help),
+        AuraSubcommand::Completion(args) => Ok(CliCommand::Completion { shell: args.shell }),
+        AuraSubcommand::LocalExec => Ok(CliCommand::LocalExec),
     }
 }
 
@@ -1043,11 +1100,7 @@ fn discover_lmstudio_models() -> Vec<String> {
 }
 
 fn read_command_output(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).to_string())
+    cmd(program, args).stderr_null().read().ok()
 }
 
 fn parse_ollama_models(raw: &str) -> Vec<String> {
@@ -1189,7 +1242,7 @@ pub async fn run_local_exec_from_env() -> i32 {
     let payload = json!({
         "model": model,
         "messages": history,
-        "stream": false
+        "stream": true
     });
 
     let client = match reqwest::Client::builder()
@@ -1218,15 +1271,14 @@ pub async fn run_local_exec_from_env() -> i32 {
     };
 
     let status = response.status();
-    let raw_body = match response.text().await {
-        Ok(body) => body,
-        Err(error) => {
-            eprintln!("local executor: failed to read response body: {error}");
-            return 1;
-        }
-    };
-
     if !status.is_success() {
+        let raw_body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("local executor: failed to read response body: {error}");
+                return 1;
+            }
+        };
         eprintln!(
             "local executor: request failed ({status}): {}",
             summarize_text(&raw_body, 400)
@@ -1234,26 +1286,86 @@ pub async fn run_local_exec_from_env() -> i32 {
         return 1;
     }
 
-    let parsed: Value = match serde_json::from_str(&raw_body) {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("local executor: invalid JSON response: {error}");
-            eprintln!("{}", summarize_text(&raw_body, 400));
-            return 1;
-        }
-    };
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
-    let content = match extract_openai_message_content(&parsed) {
-        Some(content) if !content.trim().is_empty() => content,
-        _ => {
+    let content = if content_type.contains("application/json") {
+        let raw_body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("local executor: failed to read response body: {error}");
+                return 1;
+            }
+        };
+        let parsed: Value = match serde_json::from_str(&raw_body) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("local executor: invalid JSON response: {error}");
+                eprintln!("{}", summarize_text(&raw_body, 400));
+                return 1;
+            }
+        };
+        match extract_openai_message_content(&parsed) {
+            Some(content) if !content.trim().is_empty() => {
+                for line in content.lines() {
+                    println!("agent: {line}");
+                }
+                let _ = io::stdout().flush();
+                content
+            }
+            _ => {
+                eprintln!("local executor: empty response content");
+                return 1;
+            }
+        }
+    } else {
+        let mut full_content = String::new();
+        let mut pending_line = String::new();
+        let mut pending_sse = String::new();
+
+        let mut response = response;
+        loop {
+            let next_chunk = match response.chunk().await {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("local executor: failed to read response stream: {error}");
+                    return 1;
+                }
+            };
+            let Some(chunk) = next_chunk else {
+                break;
+            };
+
+            pending_sse.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(newline_index) = pending_sse.find('\n') {
+                let mut line = pending_sse[..newline_index].to_string();
+                pending_sse.drain(..=newline_index);
+                line = line.trim_end_matches('\r').to_string();
+                consume_openai_stream_line(&line, &mut full_content, &mut pending_line);
+            }
+        }
+
+        if !pending_sse.trim().is_empty() {
+            consume_openai_stream_line(
+                pending_sse.trim_end_matches('\r'),
+                &mut full_content,
+                &mut pending_line,
+            );
+        }
+        if !pending_line.trim().is_empty() {
+            println!("agent: {}", pending_line.trim_end_matches('\r'));
+            let _ = io::stdout().flush();
+        }
+        if full_content.trim().is_empty() {
             eprintln!("local executor: empty response content");
             return 1;
         }
+        full_content
     };
-
-    for line in content.lines() {
-        println!("agent: {line}");
-    }
 
     if let Some(id) = session_id {
         history.push(json!({
@@ -1287,7 +1399,16 @@ fn openai_chat_completions_url(base_url: &str) -> String {
 fn extract_openai_message_content(value: &Value) -> Option<String> {
     let first = value.get("choices")?.as_array()?.first()?;
     let message = first.get("message")?;
-    let content = message.get("content")?;
+    extract_openai_text_content(message.get("content")?)
+}
+
+fn extract_openai_delta_content(value: &Value) -> Option<String> {
+    let first = value.get("choices")?.as_array()?.first()?;
+    let delta = first.get("delta")?;
+    extract_openai_text_content(delta.get("content")?)
+}
+
+fn extract_openai_text_content(content: &Value) -> Option<String> {
     match content {
         Value::String(text) => Some(text.to_string()),
         Value::Array(parts) => {
@@ -1307,6 +1428,48 @@ fn extract_openai_message_content(value: &Value) -> Option<String> {
             }
         }
         _ => None,
+    }
+}
+
+fn consume_openai_stream_line(
+    raw_line: &str,
+    full_content: &mut String,
+    pending_line: &mut String,
+) {
+    let line = raw_line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let payload = if let Some(value) = line.strip_prefix("data:") {
+        value.trim()
+    } else {
+        line
+    };
+    if payload.is_empty() || payload == "[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return;
+    };
+    let Some(delta) =
+        extract_openai_delta_content(&value).or_else(|| extract_openai_message_content(&value))
+    else {
+        return;
+    };
+    if delta.trim().is_empty() {
+        return;
+    }
+
+    full_content.push_str(&delta);
+    pending_line.push_str(&delta);
+
+    while let Some(newline_index) = pending_line.find('\n') {
+        let line = pending_line[..newline_index].trim_end_matches('\r');
+        if !line.is_empty() {
+            println!("agent: {line}");
+            let _ = io::stdout().flush();
+        }
+        pending_line.drain(..=newline_index);
     }
 }
 
@@ -1440,25 +1603,19 @@ fn prompt_for_local_model_selection(models: &[String]) -> Result<String, CliErro
         return Ok(default);
     }
 
-    let mut stdout = io::stdout();
-    writeln!(
-        stdout,
-        "[aura] local executor requires a model. Select one (default: 1)."
-    )?;
+    let mut selector = cliclack::select("Select local model");
     for (index, model) in models.iter().enumerate() {
-        let suffix = if index == 0 { " (default)" } else { "" };
-        writeln!(stdout, "  {}. {}{}", index + 1, model, suffix)?;
+        let hint = if index == 0 { "default" } else { "" };
+        selector = selector.item(model.clone(), model.clone(), hint);
     }
-    write!(stdout, "Selection [1-{}] (Enter=1): ", models.len())?;
-    stdout.flush()?;
 
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let selected_index = parse_model_selection_input(&input, models.len())
-        .ok_or_else(|| CliError::Arg(format!("invalid model selection: {}", input.trim())))?;
-    Ok(models[selected_index].clone())
+    let selected = selector
+        .interact()
+        .map_err(|error| CliError::Runtime(format!("model selection failed: {error}")))?;
+    Ok(selected)
 }
 
+#[cfg(test)]
 fn parse_model_selection_input(input: &str, option_count: usize) -> Option<usize> {
     if option_count == 0 {
         return None;
@@ -2504,6 +2661,30 @@ mod tests {
     }
 
     #[test]
+    fn normalize_thinking_text_strips_basic_markdown_emphasis() {
+        assert_eq!(
+            normalize_tui_line_text(TuiLineKind::Thinking, "thinking: **Preparing plan**"),
+            "Preparing plan"
+        );
+        assert_eq!(
+            normalize_tui_line_text(TuiLineKind::Thinking, "thinking: __Analyzing__"),
+            "Analyzing"
+        );
+    }
+
+    #[test]
+    fn sanitize_tui_text_strips_ansi_sequences() {
+        let input = "\u{1b}[47mwhite-bg\u{1b}[0m plain \u{1b}]0;title\u{7}\u{1b}[2K";
+        assert_eq!(sanitize_tui_text(input), "white-bg plain ");
+    }
+
+    #[test]
+    fn sanitize_tui_text_replaces_tabs_and_drops_controls() {
+        let input = "one\two\u{0}\u{1}three";
+        assert_eq!(sanitize_tui_text(input), "one    wothree");
+    }
+
+    #[test]
     fn builds_openai_chat_completion_url() {
         assert_eq!(
             openai_chat_completions_url("http://127.0.0.1:1234"),
@@ -2513,6 +2694,64 @@ mod tests {
             openai_chat_completions_url("http://127.0.0.1:11434/v1"),
             "http://127.0.0.1:11434/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn extracts_openai_delta_content_from_stream_payload() {
+        let payload: Value = serde_json::from_str(r#"{"choices":[{"delta":{"content":"hello"}}]}"#)
+            .expect("valid json");
+        assert_eq!(
+            extract_openai_delta_content(&payload).as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn extracts_openai_delta_content_from_text_parts() {
+        let payload: Value = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":[{"type":"output_text","text":"hello"},{"type":"output_text","text":" world"}]}}]}"#,
+        )
+        .expect("valid json");
+        assert_eq!(
+            extract_openai_delta_content(&payload).as_deref(),
+            Some("hello\n world")
+        );
+    }
+
+    #[test]
+    fn consumes_sse_data_lines_for_local_stream() {
+        let mut full_content = String::new();
+        let mut pending_line = String::new();
+
+        consume_openai_stream_line(
+            r#"data: {"choices":[{"delta":{"content":"hello "}}]}"#,
+            &mut full_content,
+            &mut pending_line,
+        );
+        consume_openai_stream_line(
+            r#"data: {"choices":[{"delta":{"content":"world"}}]}"#,
+            &mut full_content,
+            &mut pending_line,
+        );
+        consume_openai_stream_line("data: [DONE]", &mut full_content, &mut pending_line);
+
+        assert_eq!(full_content, "hello world");
+        assert_eq!(pending_line, "hello world");
+    }
+
+    #[test]
+    fn consumes_plain_json_lines_for_local_stream_fallback() {
+        let mut full_content = String::new();
+        let mut pending_line = String::new();
+
+        consume_openai_stream_line(
+            r#"{"choices":[{"message":{"content":"complete"}}]}"#,
+            &mut full_content,
+            &mut pending_line,
+        );
+
+        assert_eq!(full_content, "complete");
+        assert_eq!(pending_line, "complete");
     }
 
     #[test]
