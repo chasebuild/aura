@@ -102,6 +102,7 @@ pub trait LogSink {
     fn on_start(&mut self, options: &RunOptions);
     fn on_line(&mut self, stream: LogStream, line: &str);
     fn on_status(&mut self, message: &str);
+    fn on_agent_status(&mut self, _message: &str) {}
     fn on_exit(&mut self, code: Option<i32>);
 }
 
@@ -129,6 +130,10 @@ impl LogSink for PlainLogSink {
         let _ = writeln!(io::stdout(), "[status] {message}");
     }
 
+    fn on_agent_status(&mut self, message: &str) {
+        let _ = writeln!(io::stdout(), "[agent] {message}");
+    }
+
     fn on_exit(&mut self, code: Option<i32>) {
         let _ = writeln!(io::stdout(), "[aura] process exited with {:?}", code);
     }
@@ -136,11 +141,53 @@ impl LogSink for PlainLogSink {
 
 pub struct TuiLogSink {
     started_at: Instant,
-    lines: VecDeque<(LogStream, String)>,
+    lines: VecDeque<TuiLogEntry>,
     max_lines: usize,
     title: String,
     status: String,
+    agent_status: String,
     terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiLineKind {
+    Agent,
+    Thinking,
+    Action,
+    Error,
+    Output,
+}
+
+#[derive(Debug, Clone)]
+struct TuiLogEntry {
+    kind: TuiLineKind,
+    text: String,
+}
+
+fn classify_tui_line(stream: LogStream, line: &str) -> TuiLineKind {
+    if line.starts_with("agent: ") {
+        return TuiLineKind::Agent;
+    }
+    if line.starts_with("thinking: ") {
+        return TuiLineKind::Thinking;
+    }
+    if line.starts_with("cmd > ") || line.starts_with("cmd ✓ ") {
+        return TuiLineKind::Action;
+    }
+    if stream == LogStream::Stderr || line.starts_with("codex error: ") {
+        return TuiLineKind::Error;
+    }
+    TuiLineKind::Output
+}
+
+fn normalize_tui_line_text(kind: TuiLineKind, line: &str) -> String {
+    match kind {
+        TuiLineKind::Agent => line.trim_start_matches("agent: ").to_string(),
+        TuiLineKind::Thinking => line.trim_start_matches("thinking: ").to_string(),
+        TuiLineKind::Action => line.to_string(),
+        TuiLineKind::Error => line.to_string(),
+        TuiLineKind::Output => line.to_string(),
+    }
 }
 
 impl TuiLogSink {
@@ -152,6 +199,7 @@ impl TuiLogSink {
             max_lines: 500,
             title: "AURA Executor".to_string(),
             status: "starting".to_string(),
+            agent_status: "Initializing".to_string(),
             terminal,
         }
     }
@@ -173,10 +221,11 @@ impl TuiLogSink {
         let Some(terminal) = self.terminal.as_mut() else {
             let _ = writeln!(
                 io::stdout(),
-                "{} | uptime={:.1?} | status={}",
+                "{} | uptime={:.1?} | status={} | agent={}",
                 self.title,
                 self.started_at.elapsed(),
-                self.status
+                self.status,
+                self.agent_status
             );
             return;
         };
@@ -207,7 +256,7 @@ impl TuiLogSink {
             frame.render_widget(header, chunks[0]);
 
             let logs_capacity = chunks[1].height.saturating_sub(2) as usize;
-            let visible_logs: Vec<(LogStream, String)> = self
+            let visible_logs: Vec<TuiLogEntry> = self
                 .lines
                 .iter()
                 .rev()
@@ -217,14 +266,37 @@ impl TuiLogSink {
                 .collect();
             let log_lines: Vec<Line> = visible_logs
                 .into_iter()
-                .map(|(stream, line)| match stream {
-                    LogStream::Stdout => Line::from(vec![
-                        Span::styled("OUT ", Style::default().fg(Color::Green)),
-                        Span::raw(line),
+                .map(|entry| match entry.kind {
+                    TuiLineKind::Agent => Line::from(vec![
+                        Span::styled(" AGENT ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+                        Span::raw(" "),
+                        Span::styled(entry.text, Style::default().fg(Color::Cyan)),
                     ]),
-                    LogStream::Stderr => Line::from(vec![
-                        Span::styled("ERR ", Style::default().fg(Color::Red)),
-                        Span::raw(line),
+                    TuiLineKind::Thinking => Line::from(vec![
+                        Span::styled(
+                            " THINK ",
+                            Style::default().fg(Color::Black).bg(Color::Yellow),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(entry.text, Style::default().fg(Color::Yellow)),
+                    ]),
+                    TuiLineKind::Action => Line::from(vec![
+                        Span::styled(
+                            " ACTION ",
+                            Style::default().fg(Color::White).bg(Color::Blue),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(entry.text, Style::default().fg(Color::Blue)),
+                    ]),
+                    TuiLineKind::Error => Line::from(vec![
+                        Span::styled(" ERROR ", Style::default().fg(Color::White).bg(Color::Red)),
+                        Span::raw(" "),
+                        Span::styled(entry.text, Style::default().fg(Color::Red)),
+                    ]),
+                    TuiLineKind::Output => Line::from(vec![
+                        Span::styled(" OUT ", Style::default().fg(Color::Black).bg(Color::Green)),
+                        Span::raw(" "),
+                        Span::raw(entry.text),
                     ]),
                 })
                 .collect();
@@ -234,9 +306,16 @@ impl TuiLogSink {
                 .wrap(Wrap { trim: false });
             frame.render_widget(logs, chunks[1]);
 
-            let footer =
-                Paragraph::new("Ctrl+C to stop").style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(footer, chunks[2]);
+            let bar = Paragraph::new(Line::from(vec![
+                Span::styled("Run: ", Style::default().fg(Color::Yellow)),
+                Span::raw(self.status.clone()),
+                Span::raw("  |  "),
+                Span::styled("Agent: ", Style::default().fg(Color::Yellow)),
+                Span::raw(self.agent_status.clone()),
+                Span::raw("  |  q/Esc/Ctrl+C"),
+            ]))
+            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+            frame.render_widget(bar, chunks[2]);
         });
     }
 }
@@ -252,11 +331,16 @@ impl LogSink for TuiLogSink {
         self.started_at = Instant::now();
         self.title = format!("AURA Executor: {:?}", options.executor);
         self.status = "starting".to_string();
+        self.agent_status = "Initializing".to_string();
         self.redraw();
     }
 
     fn on_line(&mut self, stream: LogStream, line: &str) {
-        self.lines.push_back((stream, line.to_string()));
+        let kind = classify_tui_line(stream, line);
+        self.lines.push_back(TuiLogEntry {
+            kind,
+            text: normalize_tui_line_text(kind, line),
+        });
         while self.lines.len() > self.max_lines {
             let _ = self.lines.pop_front();
         }
@@ -269,8 +353,18 @@ impl LogSink for TuiLogSink {
         self.redraw();
     }
 
+    fn on_agent_status(&mut self, message: &str) {
+        self.agent_status = message.to_string();
+        self.redraw();
+    }
+
     fn on_exit(&mut self, code: Option<i32>) {
         self.status = format!("finished (exit={code:?})");
+        if code == Some(0) {
+            self.agent_status = "Idle".to_string();
+        } else {
+            self.agent_status = "Error".to_string();
+        }
         self.redraw();
     }
 }
@@ -626,6 +720,7 @@ enum ChildEvent {
 enum DisplayEvent {
     Line(LogStream, String),
     Status(String),
+    AgentStatus(String),
 }
 
 struct LogFormatter {
@@ -647,6 +742,13 @@ impl LogFormatter {
         let line = raw_line.trim_end();
         if line.is_empty() {
             return Vec::new();
+        }
+
+        if line.contains("Workspace Trust Required") {
+            return vec![
+                DisplayEvent::Line(stream, line.to_string()),
+                DisplayEvent::AgentStatus("Blocked: workspace trust required".to_string()),
+            ];
         }
 
         if matches!(self.executor, ExecutorKind::Codex) {
@@ -677,29 +779,41 @@ fn format_codex_event(line: &str) -> Option<Vec<DisplayEvent>> {
     let event_type = value.get("type")?.as_str()?;
 
     match event_type {
-        "thread.started" => Some(vec![DisplayEvent::Status("thread started".to_string())]),
-        "turn.started" => Some(vec![DisplayEvent::Status("turn started".to_string())]),
-        "turn.completed" => Some(vec![DisplayEvent::Status("turn completed".to_string())]),
+        "thread.started" => Some(vec![
+            DisplayEvent::Status("thread started".to_string()),
+            DisplayEvent::AgentStatus("Initializing".to_string()),
+        ]),
+        "turn.started" => Some(vec![
+            DisplayEvent::Status("turn started".to_string()),
+            DisplayEvent::AgentStatus("Thinking".to_string()),
+        ]),
+        "turn.completed" => Some(vec![
+            DisplayEvent::Status("turn completed".to_string()),
+            DisplayEvent::AgentStatus("Idle".to_string()),
+        ]),
         "turn.failed" => {
             let message = value
                 .get("error")
                 .and_then(|e| e.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
-            Some(vec![DisplayEvent::Status(format!(
-                "turn failed: {}",
-                summarize_text(message, 160)
-            ))])
+            Some(vec![
+                DisplayEvent::Status(format!("turn failed: {}", summarize_text(message, 160))),
+                DisplayEvent::AgentStatus("Error".to_string()),
+            ])
         }
         "error" => {
             let message = value
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
-            Some(vec![DisplayEvent::Line(
-                LogStream::Stderr,
-                format!("codex error: {}", summarize_text(message, 180)),
-            )])
+            Some(vec![
+                DisplayEvent::Line(
+                    LogStream::Stderr,
+                    format!("codex error: {}", summarize_text(message, 180)),
+                ),
+                DisplayEvent::AgentStatus("Error".to_string()),
+            ])
         }
         "item.started" => {
             let item = value.get("item")?;
@@ -712,10 +826,13 @@ fn format_codex_event(line: &str) -> Option<Vec<DisplayEvent>> {
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or("<command>");
-                return Some(vec![DisplayEvent::Line(
-                    LogStream::Stdout,
-                    format!("cmd > {}", summarize_text(command, 180)),
-                )]);
+                return Some(vec![
+                    DisplayEvent::Line(
+                        LogStream::Stdout,
+                        format!("cmd > {}", summarize_text(command, 180)),
+                    ),
+                    DisplayEvent::AgentStatus("Executing command".to_string()),
+                ]);
             }
             None
         }
@@ -736,30 +853,45 @@ fn format_codex_event(line: &str) -> Option<Vec<DisplayEvent>> {
                         .and_then(Value::as_i64)
                         .map(|code| code.to_string())
                         .unwrap_or_else(|| "?".to_string());
-                    Some(vec![DisplayEvent::Line(
-                        LogStream::Stdout,
-                        format!("cmd ✓ (exit={exit_code}) {}", summarize_text(command, 160)),
-                    )])
+                    Some(vec![
+                        DisplayEvent::Line(
+                            LogStream::Stdout,
+                            format!("cmd ✓ (exit={exit_code}) {}", summarize_text(command, 160)),
+                        ),
+                        DisplayEvent::AgentStatus("Thinking".to_string()),
+                    ])
                 }
                 "agent_message" => {
                     let text = item.get("text").and_then(Value::as_str).unwrap_or("");
                     if text.is_empty() {
                         return None;
                     }
-                    Some(vec![DisplayEvent::Line(
-                        LogStream::Stdout,
-                        format!("agent: {}", summarize_text(text, 200)),
-                    )])
+                    Some(vec![
+                        DisplayEvent::Line(
+                            LogStream::Stdout,
+                            format!("agent: {}", summarize_text(text, 200)),
+                        ),
+                        DisplayEvent::AgentStatus("Responding".to_string()),
+                    ])
                 }
                 "reasoning" => {
                     let text = item.get("text").and_then(Value::as_str).unwrap_or("");
                     if text.is_empty() {
                         return None;
                     }
-                    Some(vec![DisplayEvent::Line(
-                        LogStream::Stdout,
-                        format!("thinking: {}", summarize_text(text, 140)),
-                    )])
+                    let lower = text.to_ascii_lowercase();
+                    let state = if lower.contains("plan") {
+                        "Planning"
+                    } else {
+                        "Thinking"
+                    };
+                    Some(vec![
+                        DisplayEvent::Line(
+                            LogStream::Stdout,
+                            format!("thinking: {}", summarize_text(text, 140)),
+                        ),
+                        DisplayEvent::AgentStatus(state.to_string()),
+                    ])
                 }
                 _ => None,
             }
@@ -862,6 +994,7 @@ pub async fn stream_spawned(
                     match display {
                         DisplayEvent::Line(stream, line) => sink.on_line(stream, &line),
                         DisplayEvent::Status(status) => sink.on_status(&status),
+                        DisplayEvent::AgentStatus(status) => sink.on_agent_status(&status),
                     }
                 }
             }
@@ -1034,13 +1167,14 @@ mod tests {
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"hello from agent"}}"#,
         );
 
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            DisplayEvent::Line(LogStream::Stdout, line) => {
-                assert!(line.contains("agent: hello from agent"));
-            }
-            _ => panic!("expected formatted stdout line"),
-        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DisplayEvent::Line(LogStream::Stdout, line) if line.contains("agent: hello from agent")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DisplayEvent::AgentStatus(status) if status == "Responding"
+        )));
     }
 
     #[test]
@@ -1055,6 +1189,19 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(matches!(first[0], DisplayEvent::Status(_)));
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn codex_reasoning_can_set_planning_status() {
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let events = formatter.format(
+            LogStream::Stdout,
+            r#"{"type":"item.completed","item":{"type":"reasoning","text":"**Planning fixes**"}}"#,
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DisplayEvent::AgentStatus(status) if status == "Planning"
+        )));
     }
 
     #[test]
