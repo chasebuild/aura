@@ -12,6 +12,20 @@ use aura_executors::{
     AppendPrompt, CmdOverrides, ExecutionEnv, ExecutorError, ExecutorProfileId, RepoContext,
     SpawnedChild, StandardCodingAgentExecutor, adapters,
 };
+use crossterm::{
+    cursor::Show,
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Paragraph, Wrap},
+};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -125,47 +139,105 @@ pub struct TuiLogSink {
     lines: VecDeque<(LogStream, String)>,
     max_lines: usize,
     title: String,
+    status: String,
+    terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
 }
 
 impl TuiLogSink {
     pub fn new() -> Self {
+        let terminal = Self::init_terminal();
         Self {
             started_at: Instant::now(),
             lines: VecDeque::new(),
-            max_lines: 200,
+            max_lines: 500,
             title: "AURA Executor".to_string(),
+            status: "starting".to_string(),
+            terminal,
         }
     }
 
-    fn redraw(&mut self, status: &str) {
+    fn init_terminal() -> Option<Terminal<CrosstermBackend<io::Stdout>>> {
+        if enable_raw_mode().is_err() {
+            return None;
+        }
         let mut stdout = io::stdout();
-        let _ = write!(stdout, "\x1b[2J\x1b[H");
-        let _ = writeln!(stdout, "{}", self.title);
-        let _ = writeln!(stdout, "uptime: {:.1?}", self.started_at.elapsed());
-        let _ = writeln!(stdout, "status: {status}");
-        let _ = writeln!(stdout, "{}", "-".repeat(72));
-
-        let mut term_lines = std::env::var("LINES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(35);
-        if term_lines < 12 {
-            term_lines = 12;
+        if execute!(stdout, EnterAlternateScreen).is_err() {
+            let _ = disable_raw_mode();
+            return None;
         }
-        let visible = term_lines.saturating_sub(6);
+        let backend = CrosstermBackend::new(stdout);
+        Terminal::new(backend).ok()
+    }
 
-        for (stream, line) in self.lines.iter().rev().take(visible).rev() {
-            match stream {
-                LogStream::Stdout => {
-                    let _ = writeln!(stdout, "\x1b[32mOUT\x1b[0m {line}");
-                }
-                LogStream::Stderr => {
-                    let _ = writeln!(stdout, "\x1b[31mERR\x1b[0m {line}");
-                }
-            }
-        }
+    fn redraw(&mut self) {
+        let Some(terminal) = self.terminal.as_mut() else {
+            let _ = writeln!(
+                io::stdout(),
+                "{} | uptime={:.1?} | status={}",
+                self.title,
+                self.started_at.elapsed(),
+                self.status
+            );
+            return;
+        };
 
-        let _ = stdout.flush();
+        let _ = terminal.draw(|frame| {
+            let size = frame.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(8),
+                    Constraint::Length(1),
+                ])
+                .split(size);
+
+            let header = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    self.title.clone(),
+                    Style::default().fg(Color::Cyan),
+                )),
+                Line::from(format!(
+                    "uptime: {:.1?} | status: {}",
+                    self.started_at.elapsed(),
+                    self.status
+                )),
+            ])
+            .block(Block::default().borders(Borders::ALL).title("AURA"));
+            frame.render_widget(header, chunks[0]);
+
+            let logs_capacity = chunks[1].height.saturating_sub(2) as usize;
+            let visible_logs: Vec<(LogStream, String)> = self
+                .lines
+                .iter()
+                .rev()
+                .take(logs_capacity)
+                .rev()
+                .cloned()
+                .collect();
+            let log_lines: Vec<Line> = visible_logs
+                .into_iter()
+                .map(|(stream, line)| match stream {
+                    LogStream::Stdout => Line::from(vec![
+                        Span::styled("OUT ", Style::default().fg(Color::Green)),
+                        Span::raw(line),
+                    ]),
+                    LogStream::Stderr => Line::from(vec![
+                        Span::styled("ERR ", Style::default().fg(Color::Red)),
+                        Span::raw(line),
+                    ]),
+                })
+                .collect();
+
+            let logs = Paragraph::new(Text::from(log_lines))
+                .block(Block::default().borders(Borders::ALL).title("Logs"))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(logs, chunks[1]);
+
+            let footer =
+                Paragraph::new("Ctrl+C to stop").style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(footer, chunks[2]);
+        });
     }
 }
 
@@ -179,7 +251,8 @@ impl LogSink for TuiLogSink {
     fn on_start(&mut self, options: &RunOptions) {
         self.started_at = Instant::now();
         self.title = format!("AURA Executor: {:?}", options.executor);
-        self.redraw("starting");
+        self.status = "starting".to_string();
+        self.redraw();
     }
 
     fn on_line(&mut self, stream: LogStream, line: &str) {
@@ -187,15 +260,28 @@ impl LogSink for TuiLogSink {
         while self.lines.len() > self.max_lines {
             let _ = self.lines.pop_front();
         }
-        self.redraw("running");
+        self.status = "running".to_string();
+        self.redraw();
     }
 
     fn on_status(&mut self, message: &str) {
-        self.redraw(message);
+        self.status = message.to_string();
+        self.redraw();
     }
 
     fn on_exit(&mut self, code: Option<i32>) {
-        self.redraw(&format!("finished (exit={code:?})"));
+        self.status = format!("finished (exit={code:?})");
+        self.redraw();
+    }
+}
+
+impl Drop for TuiLogSink {
+    fn drop(&mut self) {
+        if let Some(mut terminal) = self.terminal.take() {
+            let _ = terminal.show_cursor();
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        }
     }
 }
 
@@ -365,16 +451,24 @@ pub async fn run_with_default_sink(options: RunOptions) -> Result<RunOutcome, Cl
     let use_tui = options.tui && io::stdout().is_terminal();
     if use_tui {
         let mut sink = TuiLogSink::new();
-        run_executor(options, &mut sink).await
+        run_executor_inner(options, &mut sink, true).await
     } else {
         let mut sink = PlainLogSink;
-        run_executor(options, &mut sink).await
+        run_executor_inner(options, &mut sink, false).await
     }
 }
 
 pub async fn run_executor(
     options: RunOptions,
     sink: &mut dyn LogSink,
+) -> Result<RunOutcome, CliError> {
+    run_executor_inner(options, sink, false).await
+}
+
+async fn run_executor_inner(
+    options: RunOptions,
+    sink: &mut dyn LogSink,
+    enable_keyboard_controls: bool,
 ) -> Result<RunOutcome, CliError> {
     sink.on_start(&options);
     if matches!(options.executor, ExecutorKind::CursorAgent)
@@ -415,7 +509,13 @@ pub async fn run_executor(
             .await?
     };
 
-    stream_spawned(options.executor.clone(), spawned, sink).await
+    stream_spawned(
+        options.executor.clone(),
+        spawned,
+        sink,
+        enable_keyboard_controls,
+    )
+    .await
 }
 
 fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> {
@@ -520,7 +620,6 @@ fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> 
 enum ChildEvent {
     Line(LogStream, String),
     StreamClosed,
-    ExitStatus(Option<i32>),
     ExitSignal(aura_executors::ExecutorExitResult),
 }
 
@@ -685,6 +784,7 @@ pub async fn stream_spawned(
     executor_kind: ExecutorKind,
     mut spawned: SpawnedChild,
     sink: &mut dyn LogSink,
+    enable_keyboard_controls: bool,
 ) -> Result<RunOutcome, CliError> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ChildEvent>();
 
@@ -700,12 +800,7 @@ pub async fn stream_spawned(
         spawn_reader(stderr, LogStream::Stderr, tx.clone());
     }
 
-    let mut child_for_wait = spawned.child;
-    let tx_wait = tx.clone();
-    tokio::spawn(async move {
-        let status = child_for_wait.wait().await.ok().and_then(|s| s.code());
-        let _ = tx_wait.send(ChildEvent::ExitStatus(status));
-    });
+    let mut child = spawned.child;
 
     if let Some(exit_signal) = spawned.exit_signal {
         let tx_signal = tx.clone();
@@ -722,19 +817,43 @@ pub async fn stream_spawned(
     let mut exit_code: Option<i32> = None;
     let mut got_exit_status = false;
     let mut formatter = LogFormatter::new(executor_kind);
+    let mut last_wait_status_at = Instant::now();
+    let mut interrupt_sent = false;
 
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        if enable_keyboard_controls
+            && should_quit_from_keyboard().unwrap_or(false)
+            && !interrupt_sent
+        {
+            interrupt_sent = true;
+            sink.on_status("stopping subprocess (user requested exit)");
+            if let Some(interrupt_sender) = spawned.interrupt_sender.take() {
+                let _ = interrupt_sender.send(());
+            }
+            let _ = child.start_kill();
+        }
+
+        if !got_exit_status && let Some(status) = child.try_wait()? {
+            got_exit_status = true;
+            exit_code = status.code();
+        }
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
         let Some(event) = (match event {
             Ok(value) => value,
             Err(_) => {
-                if !got_exit_status {
+                if !got_exit_status && last_wait_status_at.elapsed() >= Duration::from_secs(5) {
                     sink.on_status("waiting for subprocess output...");
+                    last_wait_status_at = Instant::now();
                 }
                 continue;
             }
         }) else {
-            break;
+            if got_exit_status && streams_closed >= expected_streams {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
         };
 
         match event {
@@ -747,10 +866,6 @@ pub async fn stream_spawned(
                 }
             }
             ChildEvent::StreamClosed => streams_closed += 1,
-            ChildEvent::ExitStatus(code) => {
-                got_exit_status = true;
-                exit_code = code;
-            }
             ChildEvent::ExitSignal(result) => {
                 sink.on_status("executor requested graceful exit");
                 if !got_exit_status {
@@ -758,6 +873,7 @@ pub async fn stream_spawned(
                         aura_executors::ExecutorExitResult::Success => 0,
                         aura_executors::ExecutorExitResult::Failure => 1,
                     });
+                    got_exit_status = true;
                 }
             }
         }
@@ -779,6 +895,29 @@ pub async fn stream_spawned(
         success: exit_code == Some(0),
         exit_code,
     })
+}
+
+fn should_quit_from_keyboard() -> io::Result<bool> {
+    if !event::poll(Duration::from_millis(0))? {
+        return Ok(false);
+    }
+    let Event::Key(key) = event::read()? else {
+        return Ok(false);
+    };
+    Ok(is_quit_key(key))
+}
+
+fn is_quit_key(key: KeyEvent) -> bool {
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Esc => true,
+        KeyCode::Char('q') | KeyCode::Char('Q') => true,
+        KeyCode::Char('c') | KeyCode::Char('C') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
 }
 
 fn spawn_reader<T>(reader: T, stream: LogStream, tx: mpsc::UnboundedSender<ChildEvent>)
@@ -868,6 +1007,23 @@ mod tests {
             }
             _ => panic!("expected run"),
         }
+    }
+
+    #[test]
+    fn quit_key_mapping() {
+        assert!(is_quit_key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_quit_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(is_quit_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_quit_key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]
