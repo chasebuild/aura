@@ -12,6 +12,7 @@ use aura_executors::{
     AppendPrompt, CmdOverrides, ExecutionEnv, ExecutorError, ExecutorProfileId, RepoContext,
     SpawnedChild, StandardCodingAgentExecutor, adapters,
 };
+use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -30,6 +31,7 @@ pub struct RunOptions {
     pub model: Option<String>,
     pub yolo: bool,
     pub force: bool,
+    pub trust: bool,
     pub auto_approve: bool,
     pub allow_all_tools: bool,
     pub tui: bool,
@@ -50,6 +52,7 @@ impl Default for RunOptions {
             model: None,
             yolo: false,
             force: false,
+            trust: false,
             auto_approve: true,
             allow_all_tools: false,
             tui: true,
@@ -203,7 +206,7 @@ pub enum CliCommand {
 }
 
 pub fn usage() -> &'static str {
-    "Usage:\n  aura run --executor <name> --prompt <text> [options]\n  aura tui --executor <name> --prompt <text> [options]\n  aura help\n\nExecutors:\n  codex | claude | cursor-agent | droid | amp | gemini | opencode | qwen-code | copilot | custom\n\nOptions:\n  --cwd <path>\n  --session <id>\n  --review\n  --var KEY=VALUE      (repeatable)\n  --base-command <cmd>\n  --param <arg>        (repeatable)\n  --append-prompt <text>\n  --model <name>\n  --yolo\n  --force | --trust | -f\n  --auto-approve <true|false>\n  --allow-all-tools\n  --no-tui\n"
+    "Usage:\n  aura run --executor <name> --prompt <text> [options]\n  aura tui --executor <name> --prompt <text> [options]\n  aura help\n\nExecutors:\n  codex | claude | cursor-agent | droid | amp | gemini | opencode | qwen-code | copilot | custom\n\nOptions:\n  --cwd <path>\n  --session <id>\n  --review\n  --var KEY=VALUE      (repeatable)\n  --base-command <cmd>\n  --param <arg>        (repeatable)\n  --append-prompt <text>\n  --model <name>\n  --yolo\n  --force | -f\n  --trust\n  --auto-approve <true|false>\n  --allow-all-tools\n  --no-tui\n"
 }
 
 pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, CliError> {
@@ -309,7 +312,8 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions, CliError> {
                 );
             }
             "--yolo" => opts.yolo = true,
-            "--force" | "--trust" | "-f" => opts.force = true,
+            "--force" | "-f" => opts.force = true,
+            "--trust" => opts.trust = true,
             "--allow-all-tools" => opts.allow_all_tools = true,
             "--auto-approve" => {
                 i += 1;
@@ -373,8 +377,10 @@ pub async fn run_executor(
     sink: &mut dyn LogSink,
 ) -> Result<RunOutcome, CliError> {
     sink.on_start(&options);
-    if matches!(options.executor, ExecutorKind::CursorAgent) && !(options.force || options.yolo) {
-        sink.on_status("cursor may require trust; rerun with --trust, --force, -f, or --yolo");
+    if matches!(options.executor, ExecutorKind::CursorAgent)
+        && !(options.force || options.trust || options.yolo)
+    {
+        sink.on_status("cursor may require trust; rerun with --trust (or --yolo/-f)");
     }
 
     let mut env = ExecutionEnv::new(
@@ -409,7 +415,7 @@ pub async fn run_executor(
             .await?
     };
 
-    stream_spawned(spawned, sink).await
+    stream_spawned(options.executor.clone(), spawned, sink).await
 }
 
 fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> {
@@ -445,6 +451,7 @@ fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> 
         ExecutorKind::CursorAgent => Box::new(adapters::cursor_agent(CursorAgentOptions {
             append_prompt,
             force: options.force || options.yolo,
+            trust: options.trust || options.force || options.yolo,
             model: options.model.clone(),
             cmd_overrides,
         })),
@@ -517,7 +524,165 @@ enum ChildEvent {
     ExitSignal(aura_executors::ExecutorExitResult),
 }
 
+enum DisplayEvent {
+    Line(LogStream, String),
+    Status(String),
+}
+
+struct LogFormatter {
+    executor: ExecutorKind,
+    suppressed_codex_rollout_warnings: usize,
+    emitted_codex_warning_notice: bool,
+}
+
+impl LogFormatter {
+    fn new(executor: ExecutorKind) -> Self {
+        Self {
+            executor,
+            suppressed_codex_rollout_warnings: 0,
+            emitted_codex_warning_notice: false,
+        }
+    }
+
+    fn format(&mut self, stream: LogStream, raw_line: &str) -> Vec<DisplayEvent> {
+        let line = raw_line.trim_end();
+        if line.is_empty() {
+            return Vec::new();
+        }
+
+        if matches!(self.executor, ExecutorKind::Codex) {
+            if stream == LogStream::Stderr
+                && line.contains("state db missing rollout path for thread")
+            {
+                self.suppressed_codex_rollout_warnings += 1;
+                if self.emitted_codex_warning_notice {
+                    return Vec::new();
+                }
+                self.emitted_codex_warning_notice = true;
+                return vec![DisplayEvent::Status(
+                    "codex: suppressing noisy local rollout-path warnings".to_string(),
+                )];
+            }
+
+            if let Some(formatted) = format_codex_event(line) {
+                return formatted;
+            }
+        }
+
+        vec![DisplayEvent::Line(stream, line.to_string())]
+    }
+}
+
+fn format_codex_event(line: &str) -> Option<Vec<DisplayEvent>> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let event_type = value.get("type")?.as_str()?;
+
+    match event_type {
+        "thread.started" => Some(vec![DisplayEvent::Status("thread started".to_string())]),
+        "turn.started" => Some(vec![DisplayEvent::Status("turn started".to_string())]),
+        "turn.completed" => Some(vec![DisplayEvent::Status("turn completed".to_string())]),
+        "turn.failed" => {
+            let message = value
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            Some(vec![DisplayEvent::Status(format!(
+                "turn failed: {}",
+                summarize_text(message, 160)
+            ))])
+        }
+        "error" => {
+            let message = value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            Some(vec![DisplayEvent::Line(
+                LogStream::Stderr,
+                format!("codex error: {}", summarize_text(message, 180)),
+            )])
+        }
+        "item.started" => {
+            let item = value.get("item")?;
+            let item_type = item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if item_type == "command_execution" {
+                let command = item
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<command>");
+                return Some(vec![DisplayEvent::Line(
+                    LogStream::Stdout,
+                    format!("cmd > {}", summarize_text(command, 180)),
+                )]);
+            }
+            None
+        }
+        "item.completed" => {
+            let item = value.get("item")?;
+            let item_type = item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            match item_type {
+                "command_execution" => {
+                    let command = item
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<command>");
+                    let exit_code = item
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    Some(vec![DisplayEvent::Line(
+                        LogStream::Stdout,
+                        format!("cmd ✓ (exit={exit_code}) {}", summarize_text(command, 160)),
+                    )])
+                }
+                "agent_message" => {
+                    let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                    if text.is_empty() {
+                        return None;
+                    }
+                    Some(vec![DisplayEvent::Line(
+                        LogStream::Stdout,
+                        format!("agent: {}", summarize_text(text, 200)),
+                    )])
+                }
+                "reasoning" => {
+                    let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                    if text.is_empty() {
+                        return None;
+                    }
+                    Some(vec![DisplayEvent::Line(
+                        LogStream::Stdout,
+                        format!("thinking: {}", summarize_text(text, 140)),
+                    )])
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn summarize_text(text: &str, max_len: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let total = compact.chars().count();
+    if total <= max_len {
+        compact
+    } else {
+        let mut out: String = compact.chars().take(max_len).collect();
+        out.push_str("...");
+        out
+    }
+}
+
 pub async fn stream_spawned(
+    executor_kind: ExecutorKind,
     mut spawned: SpawnedChild,
     sink: &mut dyn LogSink,
 ) -> Result<RunOutcome, CliError> {
@@ -556,6 +721,7 @@ pub async fn stream_spawned(
     let mut streams_closed = 0usize;
     let mut exit_code: Option<i32> = None;
     let mut got_exit_status = false;
+    let mut formatter = LogFormatter::new(executor_kind);
 
     loop {
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
@@ -572,7 +738,14 @@ pub async fn stream_spawned(
         };
 
         match event {
-            ChildEvent::Line(stream, line) => sink.on_line(stream, &line),
+            ChildEvent::Line(stream, line) => {
+                for display in formatter.format(stream, &line) {
+                    match display {
+                        DisplayEvent::Line(stream, line) => sink.on_line(stream, &line),
+                        DisplayEvent::Status(status) => sink.on_status(&status),
+                    }
+                }
+            }
             ChildEvent::StreamClosed => streams_closed += 1,
             ChildEvent::ExitStatus(code) => {
                 got_exit_status = true;
@@ -592,6 +765,13 @@ pub async fn stream_spawned(
         if got_exit_status && streams_closed >= expected_streams {
             break;
         }
+    }
+
+    if formatter.suppressed_codex_rollout_warnings > 0 {
+        sink.on_status(&format!(
+            "suppressed {} repeated codex rollout-path warnings",
+            formatter.suppressed_codex_rollout_warnings
+        ));
     }
 
     sink.on_exit(exit_code);
@@ -691,6 +871,37 @@ mod tests {
     }
 
     #[test]
+    fn codex_json_logs_are_humanized() {
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let events = formatter.format(
+            LogStream::Stdout,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"hello from agent"}}"#,
+        );
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            DisplayEvent::Line(LogStream::Stdout, line) => {
+                assert!(line.contains("agent: hello from agent"));
+            }
+            _ => panic!("expected formatted stdout line"),
+        }
+    }
+
+    #[test]
+    fn codex_rollout_warning_is_suppressed_after_notice() {
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let warning = "2026-01-01 ERROR codex_core::rollout::list: state db missing rollout path for thread abc";
+
+        let first = formatter.format(LogStream::Stderr, warning);
+        let second = formatter.format(LogStream::Stderr, warning);
+
+        assert_eq!(formatter.suppressed_codex_rollout_warnings, 2);
+        assert_eq!(first.len(), 1);
+        assert!(matches!(first[0], DisplayEvent::Status(_)));
+        assert!(second.is_empty());
+    }
+
+    #[test]
     fn parses_cursor_trust_aliases() {
         let args = vec![
             "run".to_string(),
@@ -702,7 +913,10 @@ mod tests {
         ];
         let parsed = parse_cli_args(&args).expect("parse");
         match parsed {
-            CliCommand::Run(opts) => assert!(opts.force),
+            CliCommand::Run(opts) => {
+                assert!(opts.trust);
+                assert!(!opts.force);
+            }
             _ => panic!("expected run"),
         }
 
@@ -740,6 +954,7 @@ mod tests {
             model: None,
             yolo: false,
             force: false,
+            trust: false,
             auto_approve: true,
             allow_all_tools: false,
             tui: false,
@@ -771,6 +986,7 @@ mod tests {
             model: None,
             yolo: false,
             force: false,
+            trust: false,
             auto_approve: true,
             allow_all_tools: false,
             tui: false,
@@ -797,6 +1013,7 @@ mod tests {
             model: None,
             yolo: true,
             force: false,
+            trust: false,
             auto_approve: true,
             allow_all_tools: false,
             tui: false,
@@ -805,5 +1022,6 @@ mod tests {
         let outcome = run_executor(options, &mut sink).await.expect("run");
         assert!(outcome.success);
         assert!(sink.stdout.iter().any(|line| line.contains("--force")));
+        assert!(sink.stdout.iter().any(|line| line.contains("--trust")));
     }
 }

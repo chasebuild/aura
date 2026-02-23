@@ -58,6 +58,7 @@ version = "0.1.0"
 dependencies = [
  "aura-contracts",
  "aura-executors",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

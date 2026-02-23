@@ -9,6 +9,7 @@ use crate::{
 pub struct CursorAgentOptions {
     pub append_prompt: AppendPrompt,
     pub force: bool,
+    pub trust: bool,
     pub model: Option<String>,
     pub cmd_overrides: CmdOverrides,
 }
@@ -17,6 +18,9 @@ pub fn cursor_agent(options: CursorAgentOptions) -> CommandBackedExecutor {
     let mut params = vec!["-p".to_string(), "--output-format=stream-json".to_string()];
     if options.force {
         params.push("--force".to_string());
+    }
+    if options.trust {
+        params.push("--trust".to_string());
     }
     if let Some(model) = options.model {
         params.extend(["--model".to_string(), model]);
