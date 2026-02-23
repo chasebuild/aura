@@ -60,6 +60,75 @@ pub struct RunCoordinator<L, R> {
     remote: R,
 }
 
+impl<L, R> RunCoordinator<L, R>
+where
+    L: LocalRunner,
+    R: RemoteRunner,
+{
+    pub fn new(local: L, remote: R) -> Self {
+        Self { local, remote }
+    }
+
+    pub async fn start(
+        &self,
+        path: RunPath,
+        request: RunStartRequest,
+    ) -> Result<RunHandle, RunCoordinatorError> {
+        match &path {
+            RunPath::Local => self
+                .local
+                .start_local(&request)
+                .await
+                .map_err(RunCoordinatorError::Local)?,
+            RunPath::Remote { worker_id } => {
+                let response = self
+                    .remote
+                    .start_remote(
+                        worker_id,
+                        StartExecutionRequest {
+                            execution_id: request.process_id,
+                            action: request.action.clone(),
+                            cwd: request.cwd.clone(),
+                            env: request.env.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(RunCoordinatorError::Remote)?;
+                if !response.accepted {
+                    return Err(RunCoordinatorError::Rejected(
+                        response.reason.unwrap_or_else(|| "unknown".to_string()),
+                    ));
+                }
+            }
+        }
+
+        Ok(RunHandle {
+            process_id: request.process_id,
+            path,
+        })
+    }
+
+    pub async fn interrupt(&self, handle: &RunHandle) -> Result<(), RunCoordinatorError> {
+        match &handle.path {
+            RunPath::Local => self
+                .local
+                .interrupt_local(handle.process_id)
+                .await
+                .map_err(RunCoordinatorError::Local),
+            RunPath::Remote { worker_id } => self
+                .remote
+                .interrupt_remote(
+                    worker_id,
+                    InterruptExecutionRequest {
+                        execution_id: handle.process_id,
+                    },
+                )
+                .await
+                .map_err(RunCoordinatorError::Remote),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,74 +212,5 @@ mod tests {
             .expect("start");
 
         coordinator.interrupt(&handle).await.expect("interrupt");
-    }
-}
-
-impl<L, R> RunCoordinator<L, R>
-where
-    L: LocalRunner,
-    R: RemoteRunner,
-{
-    pub fn new(local: L, remote: R) -> Self {
-        Self { local, remote }
-    }
-
-    pub async fn start(
-        &self,
-        path: RunPath,
-        request: RunStartRequest,
-    ) -> Result<RunHandle, RunCoordinatorError> {
-        match &path {
-            RunPath::Local => self
-                .local
-                .start_local(&request)
-                .await
-                .map_err(RunCoordinatorError::Local)?,
-            RunPath::Remote { worker_id } => {
-                let response = self
-                    .remote
-                    .start_remote(
-                        worker_id,
-                        StartExecutionRequest {
-                            execution_id: request.process_id,
-                            action: request.action.clone(),
-                            cwd: request.cwd.clone(),
-                            env: request.env.clone(),
-                        },
-                    )
-                    .await
-                    .map_err(RunCoordinatorError::Remote)?;
-                if !response.accepted {
-                    return Err(RunCoordinatorError::Rejected(
-                        response.reason.unwrap_or_else(|| "unknown".to_string()),
-                    ));
-                }
-            }
-        }
-
-        Ok(RunHandle {
-            process_id: request.process_id,
-            path,
-        })
-    }
-
-    pub async fn interrupt(&self, handle: &RunHandle) -> Result<(), RunCoordinatorError> {
-        match &handle.path {
-            RunPath::Local => self
-                .local
-                .interrupt_local(handle.process_id)
-                .await
-                .map_err(RunCoordinatorError::Local),
-            RunPath::Remote { worker_id } => self
-                .remote
-                .interrupt_remote(
-                    worker_id,
-                    InterruptExecutionRequest {
-                        execution_id: handle.process_id,
-                    },
-                )
-                .await
-                .map_err(RunCoordinatorError::Remote),
-        }
     }
 }
