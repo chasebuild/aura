@@ -18,6 +18,10 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use fuelcheck_core::reports::{
+    codex::CodexReportOptions, normalize_model_name, types::CostReportKind, types::ProviderReport,
+    types::split_usage_tokens,
+};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -104,6 +108,7 @@ pub trait LogSink {
     fn on_line(&mut self, stream: LogStream, line: &str);
     fn on_status(&mut self, message: &str);
     fn on_agent_status(&mut self, _message: &str) {}
+    fn on_usage_status(&mut self, _message: &str) {}
     fn on_exit(&mut self, code: Option<i32>);
     fn on_key_event(&mut self, _key: KeyEvent) {}
 }
@@ -149,6 +154,7 @@ pub struct TuiLogSink {
     title: String,
     status: String,
     agent_status: String,
+    usage_status: String,
     input_text: String,
     active_pane: TuiPane,
     terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
@@ -238,6 +244,7 @@ impl TuiLogSink {
             title: "AURA Executor".to_string(),
             status: "starting".to_string(),
             agent_status: "Initializing".to_string(),
+            usage_status: "Usage: -- | Cost: --".to_string(),
             input_text: String::new(),
             active_pane: TuiPane::Prompt,
             terminal,
@@ -279,6 +286,7 @@ impl TuiLogSink {
                     Constraint::Min(6),
                     Constraint::Length(3),
                     Constraint::Length(1),
+                    Constraint::Length(1),
                 ])
                 .split(size);
 
@@ -301,8 +309,13 @@ impl TuiLogSink {
             let scroll = self.log_scroll.min(max_log_scroll);
             let end = self.lines.len().saturating_sub(scroll);
             let start = end.saturating_sub(logs_capacity);
-            let visible_logs: Vec<TuiLogEntry> =
-                self.lines.iter().skip(start).take(end - start).cloned().collect();
+            let visible_logs: Vec<TuiLogEntry> = self
+                .lines
+                .iter()
+                .skip(start)
+                .take(end - start)
+                .cloned()
+                .collect();
             let log_lines: Vec<Line> = visible_logs
                 .into_iter()
                 .map(|entry| match entry.kind {
@@ -330,7 +343,10 @@ impl TuiLogSink {
                         Span::styled(entry.text, Style::default().fg(Color::Green)),
                     ]),
                     TuiLineKind::Diff => Line::from(vec![
-                        Span::styled(" DIFF ", Style::default().fg(Color::White).bg(Color::Magenta)),
+                        Span::styled(
+                            " DIFF ",
+                            Style::default().fg(Color::White).bg(Color::Magenta),
+                        ),
                         Span::raw(" "),
                         Span::styled(entry.text.clone(), diff_line_style(&entry.text)),
                     ]),
@@ -366,11 +382,7 @@ impl TuiLogSink {
             let logs_title = if max_log_scroll == 0 {
                 "Logs".to_string()
             } else {
-                format!(
-                    "Logs ({}/{})",
-                    scroll,
-                    max_log_scroll
-                )
+                format!("Logs ({}/{})", scroll, max_log_scroll)
             };
             let logs_border = if self.active_pane == TuiPane::Logs {
                 Style::default().fg(Color::Yellow)
@@ -423,10 +435,19 @@ impl TuiLogSink {
                 Span::raw("  |  "),
                 Span::styled("Pane: ", Style::default().fg(Color::Yellow)),
                 Span::raw(pane_text),
-                Span::raw("  |  Tab=switch  Arrows/Page/Home/End=scroll  Enter=send  Esc/Ctrl+C=quit"),
+                Span::raw(
+                    "  |  Tab=switch  Arrows/Page/Home/End=scroll  Enter=send  Esc/Ctrl+C=quit",
+                ),
             ]))
             .style(Style::default().fg(Color::White).bg(Color::DarkGray));
             frame.render_widget(bar, chunks[3]);
+
+            let usage_bar = Paragraph::new(Line::from(vec![
+                Span::styled("Usage: ", Style::default().fg(Color::Yellow)),
+                Span::raw(self.usage_status.clone()),
+            ]))
+            .style(Style::default().fg(Color::White).bg(Color::Black));
+            frame.render_widget(usage_bar, chunks[4]);
         });
     }
 
@@ -460,7 +481,10 @@ impl TuiLogSink {
         if by == 0 {
             return;
         }
-        self.log_scroll = self.log_scroll.saturating_add(by).min(self.max_log_scroll());
+        self.log_scroll = self
+            .log_scroll
+            .saturating_add(by)
+            .min(self.max_log_scroll());
         self.redraw();
     }
 
@@ -532,15 +556,13 @@ impl LogSink for TuiLogSink {
         self.title = format!("AURA Executor: {:?}", options.executor);
         self.status = "starting".to_string();
         self.agent_status = "Initializing".to_string();
+        self.usage_status = "Usage: -- | Cost: --".to_string();
         self.redraw();
     }
 
     fn on_line(&mut self, stream: LogStream, line: &str) {
         let kind = classify_tui_line(stream, line);
-        self.push_log_entry(
-            kind,
-            normalize_tui_line_text(kind, line),
-        );
+        self.push_log_entry(kind, normalize_tui_line_text(kind, line));
         self.status = "running".to_string();
         self.redraw();
     }
@@ -552,6 +574,11 @@ impl LogSink for TuiLogSink {
 
     fn on_agent_status(&mut self, message: &str) {
         self.agent_status = message.to_string();
+        self.redraw();
+    }
+
+    fn on_usage_status(&mut self, message: &str) {
+        self.usage_status = message.to_string();
         self.redraw();
     }
 
@@ -969,12 +996,14 @@ enum DisplayEvent {
     Line(LogStream, String),
     Status(String),
     AgentStatus(String),
+    UsageStatus(String),
 }
 
 struct LogFormatter {
     executor: ExecutorKind,
     suppressed_codex_rollout_warnings: usize,
     emitted_codex_warning_notice: bool,
+    active_codex_thread_id: Option<String>,
 }
 
 impl LogFormatter {
@@ -983,6 +1012,7 @@ impl LogFormatter {
             executor,
             suppressed_codex_rollout_warnings: 0,
             emitted_codex_warning_notice: false,
+            active_codex_thread_id: None,
         }
     }
 
@@ -1013,135 +1043,228 @@ impl LogFormatter {
                 )];
             }
 
-            if let Some(formatted) = format_codex_event(line) {
+            if let Some(formatted) = self.format_codex_event(line) {
                 return formatted;
             }
         }
 
         vec![DisplayEvent::Line(stream, line.to_string())]
     }
-}
 
-fn format_codex_event(line: &str) -> Option<Vec<DisplayEvent>> {
-    let value: Value = serde_json::from_str(line).ok()?;
-    let event_type = value.get("type")?.as_str()?;
+    fn format_codex_event(&mut self, line: &str) -> Option<Vec<DisplayEvent>> {
+        let value: Value = serde_json::from_str(line).ok()?;
+        let event_type = value.get("type")?.as_str()?;
 
-    match event_type {
-        "thread.started" => Some(vec![
-            DisplayEvent::Status("thread started".to_string()),
-            DisplayEvent::AgentStatus("Initializing".to_string()),
-        ]),
-        "turn.started" => Some(vec![
-            DisplayEvent::Status("turn started".to_string()),
-            DisplayEvent::AgentStatus("Thinking".to_string()),
-        ]),
-        "turn.completed" => Some(vec![
-            DisplayEvent::Status("turn completed".to_string()),
-            DisplayEvent::AgentStatus("Idle".to_string()),
-        ]),
-        "turn.failed" => {
-            let message = value
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            Some(vec![
-                DisplayEvent::Status(format!("turn failed: {}", summarize_text(message, 160))),
-                DisplayEvent::AgentStatus("Error".to_string()),
-            ])
-        }
-        "error" => {
-            let message = value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            Some(vec![
-                DisplayEvent::Line(
-                    LogStream::Stderr,
-                    format!("codex error: {}", summarize_text(message, 180)),
-                ),
-                DisplayEvent::AgentStatus("Error".to_string()),
-            ])
-        }
-        "item.started" => {
-            let item = value.get("item")?;
-            let item_type = item
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            if item_type == "command_execution" {
-                let command = item
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<command>");
-                return Some(vec![
-                    DisplayEvent::Line(
-                        LogStream::Stdout,
-                        format!("cmd > {}", summarize_text(command, 180)),
-                    ),
-                    DisplayEvent::AgentStatus("Executing command".to_string()),
-                ]);
+        let mut events = match event_type {
+            "thread.started" => {
+                if let Some(thread_id) = value.get("thread_id").and_then(Value::as_str) {
+                    self.active_codex_thread_id = Some(thread_id.to_string());
+                }
+                vec![
+                    DisplayEvent::Status("thread started".to_string()),
+                    DisplayEvent::AgentStatus("Initializing".to_string()),
+                ]
             }
-            None
-        }
-        "item.completed" => {
-            let item = value.get("item")?;
-            let item_type = item
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            match item_type {
-                "command_execution" => {
+            "turn.started" => vec![
+                DisplayEvent::Status("turn started".to_string()),
+                DisplayEvent::AgentStatus("Thinking".to_string()),
+            ],
+            "turn.completed" => vec![
+                DisplayEvent::Status("turn completed".to_string()),
+                DisplayEvent::AgentStatus("Idle".to_string()),
+            ],
+            "turn.failed" => {
+                let message = value
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error");
+                vec![
+                    DisplayEvent::Status(format!("turn failed: {}", summarize_text(message, 160))),
+                    DisplayEvent::AgentStatus("Error".to_string()),
+                ]
+            }
+            "error" => {
+                let message = value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error");
+                vec![
+                    DisplayEvent::Line(
+                        LogStream::Stderr,
+                        format!("codex error: {}", summarize_text(message, 180)),
+                    ),
+                    DisplayEvent::AgentStatus("Error".to_string()),
+                ]
+            }
+            "item.started" => {
+                let item = value.get("item")?;
+                let item_type = item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                if item_type == "command_execution" {
                     let command = item
                         .get("command")
                         .and_then(Value::as_str)
                         .unwrap_or("<command>");
-                    let exit_code = item
-                        .get("exit_code")
-                        .and_then(Value::as_i64)
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "?".to_string());
-                    Some(vec![
+                    vec![
                         DisplayEvent::Line(
                             LogStream::Stdout,
-                            format!("cmd ✓ (exit={exit_code}) {}", summarize_text(command, 160)),
+                            format!("cmd > {}", summarize_text(command, 180)),
                         ),
-                        DisplayEvent::AgentStatus("Thinking".to_string()),
-                    ])
+                        DisplayEvent::AgentStatus("Executing command".to_string()),
+                    ]
+                } else {
+                    return None;
                 }
-                "agent_message" => {
-                    let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-                    if text.is_empty() {
-                        return None;
-                    }
-                    let mut events = format_agent_message(text);
-                    events.push(DisplayEvent::AgentStatus("Responding".to_string()));
-                    Some(events)
-                }
-                "reasoning" => {
-                    let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-                    if text.is_empty() {
-                        return None;
-                    }
-                    let lower = text.to_ascii_lowercase();
-                    let state = if lower.contains("plan") {
-                        "Planning"
-                    } else {
-                        "Thinking"
-                    };
-                    Some(vec![
-                        DisplayEvent::Line(
-                            LogStream::Stdout,
-                            format!("thinking: {}", summarize_text(text, 140)),
-                        ),
-                        DisplayEvent::AgentStatus(state.to_string()),
-                    ])
-                }
-                _ => None,
             }
+            "item.completed" => {
+                let item = value.get("item")?;
+                let item_type = item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                match item_type {
+                    "command_execution" => {
+                        let command = item
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<command>");
+                        let exit_code = item
+                            .get("exit_code")
+                            .and_then(Value::as_i64)
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        vec![
+                            DisplayEvent::Line(
+                                LogStream::Stdout,
+                                format!(
+                                    "cmd ✓ (exit={exit_code}) {}",
+                                    summarize_text(command, 160)
+                                ),
+                            ),
+                            DisplayEvent::AgentStatus("Thinking".to_string()),
+                        ]
+                    }
+                    "agent_message" => {
+                        let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                        if text.is_empty() {
+                            return None;
+                        }
+                        let mut events = format_agent_message(text);
+                        events.push(DisplayEvent::AgentStatus("Responding".to_string()));
+                        events
+                    }
+                    "reasoning" => {
+                        let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                        if text.is_empty() {
+                            return None;
+                        }
+                        let lower = text.to_ascii_lowercase();
+                        let state = if lower.contains("plan") {
+                            "Planning"
+                        } else {
+                            "Thinking"
+                        };
+                        vec![
+                            DisplayEvent::Line(
+                                LogStream::Stdout,
+                                format!("thinking: {}", summarize_text(text, 140)),
+                            ),
+                            DisplayEvent::AgentStatus(state.to_string()),
+                        ]
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+
+        if matches!(
+            event_type,
+            "thread.started" | "turn.completed" | "turn.failed"
+        ) && let Some(thread_id) = self.active_codex_thread_id.clone()
+        {
+            events.push(DisplayEvent::UsageStatus(build_codex_usage_status(
+                &thread_id,
+            )));
         }
-        _ => None,
+
+        Some(events)
     }
+}
+
+fn build_codex_usage_status(thread_id: &str) -> String {
+    let options = CodexReportOptions {
+        report: CostReportKind::Session,
+        since: None,
+        until: None,
+        timezone: None,
+    };
+
+    let report = match fuelcheck_core::reports::codex::build_report(&options) {
+        Ok(report) => report,
+        Err(_) => {
+            return format!(
+                "thread={} | collecting usage...",
+                summarize_text(thread_id, 12)
+            );
+        }
+    };
+    let ProviderReport::Session(response) = report else {
+        return format!(
+            "thread={} | usage unavailable",
+            summarize_text(thread_id, 12)
+        );
+    };
+
+    let Some(row) = response
+        .sessions
+        .iter()
+        .find(|session| session.session_id.ends_with(thread_id))
+    else {
+        return format!(
+            "thread={} | collecting usage...",
+            summarize_text(thread_id, 12)
+        );
+    };
+
+    let split = split_usage_tokens(
+        row.input_tokens,
+        row.cached_input_tokens,
+        row.output_tokens,
+        row.reasoning_output_tokens,
+    );
+    let model = row
+        .models
+        .keys()
+        .next()
+        .map(|raw| normalize_model_name(raw))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    format!(
+        "in={} cache={} out={} reason={} total={} | cost=${:.4} | model={}",
+        format_count(split.input_tokens),
+        format_count(split.cache_read_tokens),
+        format_count(split.output_tokens),
+        format_count(split.reasoning_tokens),
+        format_count(row.total_tokens),
+        row.cost_usd,
+        model
+    )
+}
+
+fn format_count(value: u64) -> String {
+    let raw = value.to_string();
+    let mut out = String::new();
+    for (index, ch) in raw.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
 }
 
 fn format_agent_message(text: &str) -> Vec<DisplayEvent> {
@@ -1231,7 +1354,10 @@ fn emit_code_fence(events: &mut Vec<DisplayEvent>, lang: &str, lines: &[String])
 
     if lang_lower == "json" || lang_lower == "jsonc" {
         if let Ok(value) = serde_json::from_str::<Value>(&content) {
-            events.push(DisplayEvent::Line(LogStream::Stdout, "json: block".to_string()));
+            events.push(DisplayEvent::Line(
+                LogStream::Stdout,
+                "json: block".to_string(),
+            ));
             if let Ok(pretty) = serde_json::to_string_pretty(&value) {
                 for line in pretty.lines() {
                     events.push(DisplayEvent::Line(
@@ -1244,10 +1370,7 @@ fn emit_code_fence(events: &mut Vec<DisplayEvent>, lang: &str, lines: &[String])
         }
     }
 
-    if lang_lower.contains("diff")
-        || lang_lower.contains("patch")
-        || looks_like_diff_block(lines)
-    {
+    if lang_lower.contains("diff") || lang_lower.contains("patch") || looks_like_diff_block(lines) {
         for line in lines {
             events.push(DisplayEvent::Line(
                 LogStream::Stdout,
@@ -1409,6 +1532,7 @@ pub async fn stream_spawned(
                         DisplayEvent::Line(stream, line) => sink.on_line(stream, &line),
                         DisplayEvent::Status(status) => sink.on_status(&status),
                         DisplayEvent::AgentStatus(status) => sink.on_agent_status(&status),
+                        DisplayEvent::UsageStatus(status) => sink.on_usage_status(&status),
                     }
                 }
             }
@@ -1699,13 +1823,11 @@ mod tests {
             KeyCode::Char('q'),
             KeyModifiers::NONE
         )));
-        assert!(is_quit_key(
-            KeyEvent::new_with_kind(
-                KeyCode::Char('q'),
-                KeyModifiers::NONE,
-                crossterm::event::KeyEventKind::Repeat
-            )
-        ));
+        assert!(is_quit_key(KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Repeat
+        )));
         assert!(!is_quit_key(KeyEvent::new_with_kind(
             KeyCode::Char('q'),
             KeyModifiers::NONE,
@@ -1726,28 +1848,43 @@ mod tests {
     fn prompt_input_keys_support_edit_submit_and_quit() {
         let mut input = String::new();
         assert!(matches!(
-            apply_prompt_input_key(&mut input, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+            apply_prompt_input_key(
+                &mut input,
+                KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)
+            ),
             PromptInputUpdate::Continue
         ));
         assert!(matches!(
-            apply_prompt_input_key(&mut input, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            apply_prompt_input_key(
+                &mut input,
+                KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)
+            ),
             PromptInputUpdate::Continue
         ));
         assert_eq!(input, "hi");
 
         assert!(matches!(
-            apply_prompt_input_key(&mut input, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            apply_prompt_input_key(
+                &mut input,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+            ),
             PromptInputUpdate::Continue
         ));
         assert_eq!(input, "hiq");
 
         assert!(matches!(
-            apply_prompt_input_key(&mut input, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            apply_prompt_input_key(
+                &mut input,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+            ),
             PromptInputUpdate::Continue
         ));
         assert_eq!(input, "hi");
 
-        let submit = apply_prompt_input_key(&mut input, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let submit = apply_prompt_input_key(
+            &mut input,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         match submit {
             PromptInputUpdate::Submit(prompt) => assert_eq!(prompt, "hi"),
             _ => panic!("expected submit"),
