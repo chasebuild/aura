@@ -268,9 +268,9 @@ impl TuiLogSink {
                 .into_iter()
                 .map(|entry| match entry.kind {
                     TuiLineKind::Agent => Line::from(vec![
-                        Span::styled(" AGENT ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+                        Span::styled(" AGENT ", Style::default().fg(Color::White).bg(Color::Cyan)),
                         Span::raw(" "),
-                        Span::styled(entry.text, Style::default().fg(Color::Cyan)),
+                        Span::styled(entry.text, Style::default().fg(Color::White)),
                     ]),
                     TuiLineKind::Thinking => Line::from(vec![
                         Span::styled(
