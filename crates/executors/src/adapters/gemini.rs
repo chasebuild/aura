@@ -14,7 +14,7 @@ pub struct GeminiOptions {
 }
 
 pub fn gemini(options: GeminiOptions) -> CommandBackedExecutor {
-    let mut params = vec!["--experimental-acp".to_string()];
+    let mut params = vec!["--output-format=stream-json".to_string()];
     if let Some(model) = options.model {
         params.extend(["--model".to_string(), model]);
     }
@@ -31,7 +31,7 @@ pub fn gemini(options: GeminiOptions) -> CommandBackedExecutor {
         base_command: "npx -y @google/gemini-cli@0.23.0".to_string(),
         default_params: params,
         append_prompt: options.append_prompt,
-        prompt_input_mode: PromptInputMode::EnvVar,
+        prompt_input_mode: PromptInputMode::Arg,
         cmd_overrides: options.cmd_overrides,
         capabilities: vec![ExecutorCapability::SessionFork],
     })

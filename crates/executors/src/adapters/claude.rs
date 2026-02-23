@@ -27,7 +27,6 @@ pub fn claude(options: ClaudeOptions) -> CommandBackedExecutor {
         "-p".to_string(),
         "--verbose".to_string(),
         "--output-format=stream-json".to_string(),
-        "--input-format=stream-json".to_string(),
         "--include-partial-messages".to_string(),
         "--disallowedTools=AskUserQuestion".to_string(),
     ];
@@ -48,7 +47,7 @@ pub fn claude(options: ClaudeOptions) -> CommandBackedExecutor {
         base_command: base.to_string(),
         default_params: params,
         append_prompt: options.append_prompt,
-        prompt_input_mode: PromptInputMode::EnvVar,
+        prompt_input_mode: PromptInputMode::Arg,
         cmd_overrides: options.cmd_overrides,
         capabilities: vec![ExecutorCapability::SessionFork],
     })

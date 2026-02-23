@@ -5,15 +5,13 @@ use crate::{
     ExecutorProfileId, PromptInputMode,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LocalOptions {
     pub append_prompt: AppendPrompt,
     pub model: Option<String>,
     pub openai_endpoint: Option<String>,
     pub cmd_overrides: CmdOverrides,
 }
-
 
 pub fn local(options: LocalOptions) -> CommandBackedExecutor {
     let params = vec!["local-exec".to_string()];

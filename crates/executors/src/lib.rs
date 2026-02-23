@@ -760,4 +760,82 @@ mod tests {
         assert!(stdout.contains("--json"));
         assert!(stdout.contains("hello-codex"));
     }
+
+    #[tokio::test]
+    async fn gemini_adapter_passes_prompt_as_argument_without_acp_mode() {
+        let executor = adapters::gemini(adapters::GeminiOptions {
+            append_prompt: AppendPrompt::default(),
+            model: Some("gemini-2.5-pro".to_string()),
+            yolo: false,
+            cmd_overrides: CmdOverrides {
+                base_command_override: Some("echo".to_string()),
+                additional_params: None,
+                env: None,
+            },
+        });
+
+        let child = executor
+            .spawn_initial(
+                Path::new("."),
+                "hello-gemini",
+                &ExecutionEnv::new(
+                    RepoContext {
+                        workspace_root: PathBuf::from("."),
+                        repo_names: vec![],
+                    },
+                    false,
+                ),
+            )
+            .await
+            .expect("spawn")
+            .child;
+
+        let output = child.wait_with_output().await.expect("wait");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("--output-format=stream-json"));
+        assert!(stdout.contains("--model gemini-2.5-pro"));
+        assert!(stdout.contains("hello-gemini"));
+        assert!(!stdout.contains("--experimental-acp"));
+    }
+
+    #[tokio::test]
+    async fn claude_adapter_passes_prompt_as_argument_without_stream_json_input_mode() {
+        let executor = adapters::claude(adapters::ClaudeOptions {
+            append_prompt: AppendPrompt::default(),
+            model: Some("claude-sonnet-4-5".to_string()),
+            plan: false,
+            approvals: false,
+            dangerously_skip_permissions: false,
+            claude_code_router: false,
+            cmd_overrides: CmdOverrides {
+                base_command_override: Some("echo".to_string()),
+                additional_params: None,
+                env: None,
+            },
+        });
+
+        let child = executor
+            .spawn_initial(
+                Path::new("."),
+                "hello-claude",
+                &ExecutionEnv::new(
+                    RepoContext {
+                        workspace_root: PathBuf::from("."),
+                        repo_names: vec![],
+                    },
+                    false,
+                ),
+            )
+            .await
+            .expect("spawn")
+            .child;
+
+        let output = child.wait_with_output().await.expect("wait");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("-p"));
+        assert!(stdout.contains("--output-format=stream-json"));
+        assert!(stdout.contains("--model claude-sonnet-4-5"));
+        assert!(stdout.contains("hello-claude"));
+        assert!(!stdout.contains("--input-format=stream-json"));
+    }
 }
