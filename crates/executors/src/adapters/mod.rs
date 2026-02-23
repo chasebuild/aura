@@ -1,0 +1,21 @@
+mod amp;
+mod claude;
+mod codex;
+mod copilot;
+mod cursor_agent;
+mod custom;
+mod droid;
+mod gemini;
+mod opencode;
+mod qwen_code;
+
+pub use amp::{AmpOptions, amp, amp_default};
+pub use claude::{ClaudeOptions, claude, claude_default};
+pub use codex::{CodexOptions, codex, codex_default};
+pub use copilot::{CopilotOptions, copilot, copilot_default};
+pub use cursor_agent::{CursorAgentOptions, cursor_agent, cursor_default};
+pub use custom::custom_command;
+pub use droid::{DroidOptions, droid, droid_default};
+pub use gemini::{GeminiOptions, gemini, gemini_default};
+pub use opencode::{OpencodeOptions, opencode, opencode_default};
+pub use qwen_code::{QwenCodeOptions, qwen_code, qwen_code_default};
