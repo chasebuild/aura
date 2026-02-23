@@ -950,24 +950,45 @@ pub async fn stream_spawned(
     let mut got_exit_status = false;
     let mut formatter = LogFormatter::new(executor_kind);
     let mut last_wait_status_at = Instant::now();
-    let mut interrupt_sent = false;
+    let mut quit_requested_at: Option<Instant> = None;
+    let mut completion_reported = false;
 
     loop {
-        if enable_keyboard_controls
-            && should_quit_from_keyboard().unwrap_or(false)
-            && !interrupt_sent
-        {
-            interrupt_sent = true;
-            sink.on_status("stopping subprocess (user requested exit)");
-            if let Some(interrupt_sender) = spawned.interrupt_sender.take() {
-                let _ = interrupt_sender.send(());
+        if enable_keyboard_controls && should_quit_from_keyboard().unwrap_or(false) {
+            if got_exit_status && streams_closed >= expected_streams {
+                break;
             }
+            if quit_requested_at.is_none() {
+                sink.on_status("stopping subprocess (user requested exit)");
+                if let Some(interrupt_sender) = spawned.interrupt_sender.take() {
+                    let _ = interrupt_sender.send(());
+                }
+            }
+            quit_requested_at.get_or_insert_with(Instant::now);
             let _ = child.start_kill();
         }
 
         if !got_exit_status && let Some(status) = child.try_wait()? {
             got_exit_status = true;
             exit_code = status.code();
+        }
+
+        if got_exit_status && streams_closed >= expected_streams && !completion_reported {
+            sink.on_exit(exit_code);
+            completion_reported = true;
+        }
+
+        if let Some(requested_at) = quit_requested_at {
+            if got_exit_status {
+                break;
+            }
+            if requested_at.elapsed() >= Duration::from_secs(2) {
+                sink.on_status("forcing exit after quit request");
+                if exit_code.is_none() {
+                    exit_code = Some(130);
+                }
+                break;
+            }
         }
 
         let event = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
@@ -981,7 +1002,10 @@ pub async fn stream_spawned(
                 continue;
             }
         }) else {
-            if got_exit_status && streams_closed >= expected_streams {
+            if got_exit_status
+                && streams_closed >= expected_streams
+                && (!enable_keyboard_controls || quit_requested_at.is_some())
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1011,7 +1035,10 @@ pub async fn stream_spawned(
             }
         }
 
-        if got_exit_status && streams_closed >= expected_streams {
+        if got_exit_status
+            && streams_closed >= expected_streams
+            && (!enable_keyboard_controls || quit_requested_at.is_some())
+        {
             break;
         }
     }
@@ -1023,7 +1050,9 @@ pub async fn stream_spawned(
         ));
     }
 
-    sink.on_exit(exit_code);
+    if !completion_reported {
+        sink.on_exit(exit_code);
+    }
     Ok(RunOutcome {
         success: exit_code == Some(0),
         exit_code,
@@ -1041,7 +1070,7 @@ fn should_quit_from_keyboard() -> io::Result<bool> {
 }
 
 fn is_quit_key(key: KeyEvent) -> bool {
-    if key.kind != KeyEventKind::Press {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return false;
     }
 
@@ -1147,6 +1176,18 @@ mod tests {
         assert!(is_quit_key(KeyEvent::new(
             KeyCode::Char('q'),
             KeyModifiers::NONE
+        )));
+        assert!(is_quit_key(
+            KeyEvent::new_with_kind(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat
+            )
+        ));
+        assert!(!is_quit_key(KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Release
         )));
         assert!(is_quit_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(is_quit_key(KeyEvent::new(
