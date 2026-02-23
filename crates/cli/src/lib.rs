@@ -844,7 +844,7 @@ impl Drop for TuiLogSink {
 
 #[derive(Debug, Clone)]
 pub enum CliCommand {
-    Run(RunOptions),
+    Run(Box<RunOptions>),
     Help,
     Completion { shell: Shell },
     LocalExec,
@@ -1005,10 +1005,12 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, CliError> {
     let parsed = AuraCli::try_parse_from(argv).map_err(|error| CliError::Arg(error.to_string()))?;
 
     match parsed.command.unwrap_or(AuraSubcommand::Help) {
-        AuraSubcommand::Run(run_args) => {
-            Ok(CliCommand::Run(convert_run_cli_args(run_args, false)?))
-        }
-        AuraSubcommand::Tui(run_args) => Ok(CliCommand::Run(convert_run_cli_args(run_args, true)?)),
+        AuraSubcommand::Run(run_args) => Ok(CliCommand::Run(Box::new(convert_run_cli_args(
+            run_args, false,
+        )?))),
+        AuraSubcommand::Tui(run_args) => Ok(CliCommand::Run(Box::new(convert_run_cli_args(
+            run_args, true,
+        )?))),
         AuraSubcommand::Help => Ok(CliCommand::Help),
         AuraSubcommand::Completion(args) => Ok(CliCommand::Completion { shell: args.shell }),
         AuraSubcommand::LocalExec => Ok(CliCommand::LocalExec),

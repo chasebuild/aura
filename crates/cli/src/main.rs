@@ -26,7 +26,7 @@ async fn main() {
         CliCommand::LocalExec => {
             std::process::exit(run_local_exec_from_env().await);
         }
-        CliCommand::Run(options) => match run_with_default_sink(options).await {
+        CliCommand::Run(options) => match run_with_default_sink(*options).await {
             Ok(outcome) => {
                 if !outcome.success {
                     std::process::exit(outcome.exit_code.unwrap_or(1));
