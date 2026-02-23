@@ -64,8 +64,8 @@ version = "0.1.0"
 dependencies = [
  "aura-contracts",
  "aura-executors",
+ "aura-usage",
  "crossterm",
- "fuelcheck-core",
  "ratatui",
  "serde_json",
  "thiserror 2.0.18",
@@ -137,6 +137,16 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "aura-usage"
+version = "0.1.0"
+dependencies = [
+ "aura-contracts",
+ "chrono",
+ "fuelcheck-core",
+ "serde_json",
 ]
 
 [[package]]

@@ -12,15 +12,12 @@ use aura_executors::{
     AppendPrompt, CmdOverrides, ExecutionEnv, ExecutorError, ExecutorProfileId, RepoContext,
     SpawnedChild, StandardCodingAgentExecutor, adapters,
 };
+use aura_usage::UsageTracker;
 use crossterm::{
     cursor::Show,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use fuelcheck_core::reports::{
-    codex::CodexReportOptions, normalize_model_name, types::CostReportKind, types::ProviderReport,
-    types::split_usage_tokens,
 };
 use ratatui::{
     Terminal,
@@ -556,7 +553,7 @@ impl LogSink for TuiLogSink {
         self.title = format!("AURA Executor: {:?}", options.executor);
         self.status = "starting".to_string();
         self.agent_status = "Initializing".to_string();
-        self.usage_status = "Usage: -- | Cost: --".to_string();
+        self.usage_status = UsageTracker::new(&options.executor).initial_status();
         self.redraw();
     }
 
@@ -1003,16 +1000,16 @@ struct LogFormatter {
     executor: ExecutorKind,
     suppressed_codex_rollout_warnings: usize,
     emitted_codex_warning_notice: bool,
-    active_codex_thread_id: Option<String>,
+    usage_tracker: UsageTracker,
 }
 
 impl LogFormatter {
     fn new(executor: ExecutorKind) -> Self {
         Self {
+            usage_tracker: UsageTracker::new(&executor),
             executor,
             suppressed_codex_rollout_warnings: 0,
             emitted_codex_warning_notice: false,
-            active_codex_thread_id: None,
         }
     }
 
@@ -1057,9 +1054,6 @@ impl LogFormatter {
 
         let mut events = match event_type {
             "thread.started" => {
-                if let Some(thread_id) = value.get("thread_id").and_then(Value::as_str) {
-                    self.active_codex_thread_id = Some(thread_id.to_string());
-                }
                 vec![
                     DisplayEvent::Status("thread started".to_string()),
                     DisplayEvent::AgentStatus("Initializing".to_string()),
@@ -1181,90 +1175,12 @@ impl LogFormatter {
             _ => return None,
         };
 
-        if matches!(
-            event_type,
-            "thread.started" | "turn.completed" | "turn.failed"
-        ) && let Some(thread_id) = self.active_codex_thread_id.clone()
-        {
-            events.push(DisplayEvent::UsageStatus(build_codex_usage_status(
-                &thread_id,
-            )));
+        if let Some(status) = self.usage_tracker.on_event(event_type, &value) {
+            events.push(DisplayEvent::UsageStatus(status));
         }
 
         Some(events)
     }
-}
-
-fn build_codex_usage_status(thread_id: &str) -> String {
-    let options = CodexReportOptions {
-        report: CostReportKind::Session,
-        since: None,
-        until: None,
-        timezone: None,
-    };
-
-    let report = match fuelcheck_core::reports::codex::build_report(&options) {
-        Ok(report) => report,
-        Err(_) => {
-            return format!(
-                "thread={} | collecting usage...",
-                summarize_text(thread_id, 12)
-            );
-        }
-    };
-    let ProviderReport::Session(response) = report else {
-        return format!(
-            "thread={} | usage unavailable",
-            summarize_text(thread_id, 12)
-        );
-    };
-
-    let Some(row) = response
-        .sessions
-        .iter()
-        .find(|session| session.session_id.ends_with(thread_id))
-    else {
-        return format!(
-            "thread={} | collecting usage...",
-            summarize_text(thread_id, 12)
-        );
-    };
-
-    let split = split_usage_tokens(
-        row.input_tokens,
-        row.cached_input_tokens,
-        row.output_tokens,
-        row.reasoning_output_tokens,
-    );
-    let model = row
-        .models
-        .keys()
-        .next()
-        .map(|raw| normalize_model_name(raw))
-        .unwrap_or_else(|| "unknown".to_string());
-
-    format!(
-        "in={} cache={} out={} reason={} total={} | cost=${:.4} | model={}",
-        format_count(split.input_tokens),
-        format_count(split.cache_read_tokens),
-        format_count(split.output_tokens),
-        format_count(split.reasoning_tokens),
-        format_count(row.total_tokens),
-        row.cost_usd,
-        model
-    )
-}
-
-fn format_count(value: u64) -> String {
-    let raw = value.to_string();
-    let mut out = String::new();
-    for (index, ch) in raw.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out.chars().rev().collect()
 }
 
 fn format_agent_message(text: &str) -> Vec<DisplayEvent> {

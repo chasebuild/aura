@@ -1,0 +1,12 @@
+[package]
+name = "aura-usage"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-contracts = { path = "../contracts" }
+chrono.workspace = true
+fuelcheck-core = { version = "0.1.0" }
+serde_json.workspace = true
