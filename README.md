@@ -2,6 +2,8 @@
 
 AURA is a library-first Rust workspace for orchestrating multiple coding agents across local and remote workers.
 
+<img width="2304" height="1536" alt="Group 1228" src="https://github.com/user-attachments/assets/e0f40a49-4e04-4848-816f-5f09003d6551" />
+
 ## Crates
 
 - `aura-contracts`: Shared domain models and execution/state machine enums.
