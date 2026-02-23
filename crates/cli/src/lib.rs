@@ -106,6 +106,7 @@ pub trait LogSink {
     fn on_status(&mut self, message: &str);
     fn on_agent_status(&mut self, _message: &str) {}
     fn on_usage_status(&mut self, _message: &str) {}
+    fn on_model_unavailable(&mut self) {}
     fn on_exit(&mut self, code: Option<i32>);
     fn on_key_event(&mut self, _key: KeyEvent) {}
 }
@@ -154,6 +155,7 @@ pub struct TuiLogSink {
     usage_status: String,
     input_text: String,
     active_pane: TuiPane,
+    model_config: ModelConfiguration,
     terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
 }
 
@@ -174,12 +176,92 @@ enum TuiLineKind {
 enum TuiPane {
     Logs,
     Prompt,
+    Model,
 }
 
 #[derive(Debug, Clone)]
 struct TuiLogEntry {
     kind: TuiLineKind,
     text: String,
+}
+
+#[derive(Debug, Clone)]
+struct ModelConfiguration {
+    options: Vec<String>,
+    selected_index: usize,
+    unavailable: bool,
+}
+
+impl ModelConfiguration {
+    fn new() -> Self {
+        Self {
+            options: Vec::new(),
+            selected_index: 0,
+            unavailable: false,
+        }
+    }
+
+    fn configure(&mut self, executor: &ExecutorKind, selected_model: Option<&str>) {
+        self.options = model_options_for_executor(executor);
+        self.unavailable = false;
+
+        if let Some(model) = selected_model {
+            let trimmed = model.trim();
+            if !trimmed.is_empty() && !self.options.iter().any(|option| option == trimmed) {
+                self.options.insert(0, trimmed.to_string());
+            }
+        }
+
+        self.selected_index = selected_model
+            .and_then(|model| self.options.iter().position(|option| option == model))
+            .unwrap_or(0);
+    }
+
+    fn selected_model(&self) -> Option<String> {
+        if self.unavailable {
+            return None;
+        }
+        self.options.get(self.selected_index).cloned()
+    }
+
+    fn selected_label(&self) -> Option<String> {
+        self.options
+            .get(self.selected_index)
+            .cloned()
+            .or_else(|| self.options.first().cloned())
+    }
+
+    fn choices_label(&self) -> String {
+        self.options.join(" | ")
+    }
+
+    fn cycle_next(&mut self) {
+        if self.options.is_empty() {
+            return;
+        }
+        self.selected_index = (self.selected_index + 1) % self.options.len();
+    }
+
+    fn cycle_prev(&mut self) {
+        if self.options.is_empty() {
+            return;
+        }
+        if self.selected_index == 0 {
+            self.selected_index = self.options.len() - 1;
+        } else {
+            self.selected_index -= 1;
+        }
+    }
+
+    fn mark_unavailable(&mut self) {
+        self.options = vec!["unavailable".to_string()];
+        self.selected_index = 0;
+        self.unavailable = true;
+    }
+
+    fn has_options(&self) -> bool {
+        !self.options.is_empty()
+    }
 }
 
 fn classify_tui_line(stream: LogStream, line: &str) -> TuiLineKind {
@@ -244,6 +326,7 @@ impl TuiLogSink {
             usage_status: "Usage: -- | Cost: --".to_string(),
             input_text: String::new(),
             active_pane: TuiPane::Prompt,
+            model_config: ModelConfiguration::new(),
             terminal,
         }
     }
@@ -282,6 +365,7 @@ impl TuiLogSink {
                     Constraint::Length(3),
                     Constraint::Min(6),
                     Constraint::Length(3),
+                    Constraint::Length(3),
                     Constraint::Length(1),
                     Constraint::Length(1),
                 ])
@@ -319,12 +403,16 @@ impl TuiLogSink {
                     TuiLineKind::User => Line::from(vec![
                         Span::styled(" USER ", Style::default().fg(Color::Black).bg(Color::White)),
                         Span::raw(" "),
-                        Span::styled(entry.text, Style::default().fg(Color::White)),
+                        Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                        Span::styled(entry.text, Style::default().fg(Color::Black).bg(Color::Gray)),
+                        Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     ]),
                     TuiLineKind::Agent => Line::from(vec![
                         Span::styled(" AGENT ", Style::default().fg(Color::White).bg(Color::Cyan)),
                         Span::raw(" "),
-                        Span::styled(entry.text, Style::default().fg(Color::White)),
+                        Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+                        Span::styled(entry.text, Style::default().fg(Color::Black).bg(Color::Cyan)),
+                        Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Cyan)),
                     ]),
                     TuiLineKind::Code => Line::from(vec![
                         Span::styled(
@@ -419,9 +507,51 @@ impl TuiLogSink {
                 .wrap(Wrap { trim: false });
             frame.render_widget(prompt, chunks[2]);
 
+            let model_border = if self.active_pane == TuiPane::Model {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            let model_text = if !self.model_config.has_options() {
+                Text::from(Line::from(vec![
+                    Span::styled("n/a", Style::default().fg(Color::DarkGray)),
+                    Span::raw("  "),
+                    Span::styled(
+                        "(model override unsupported for this executor)",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            } else {
+                let selected = self
+                    .model_config
+                    .selected_label()
+                    .unwrap_or_else(|| "n/a".to_string());
+                let choices = self.model_config.choices_label();
+                Text::from(vec![
+                    Line::from(vec![
+                        Span::styled("selected: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(selected, Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("choices: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(choices, Style::default().fg(Color::Gray)),
+                    ]),
+                ])
+            };
+            let model = Paragraph::new(model_text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Model")
+                        .border_style(model_border),
+                )
+                .wrap(Wrap { trim: false });
+            frame.render_widget(model, chunks[3]);
+
             let pane_text = match self.active_pane {
                 TuiPane::Logs => "Logs",
                 TuiPane::Prompt => "Prompt",
+                TuiPane::Model => "Model",
             };
             let bar = Paragraph::new(Line::from(vec![
                 Span::styled("Run: ", Style::default().fg(Color::Yellow)),
@@ -433,18 +563,18 @@ impl TuiLogSink {
                 Span::styled("Pane: ", Style::default().fg(Color::Yellow)),
                 Span::raw(pane_text),
                 Span::raw(
-                    "  |  Tab=switch  Arrows/Page/Home/End=scroll  Enter=send  Esc/Ctrl+C=quit",
+                    "  |  Tab=switch  Arrows/Page/Home/End=scroll  <-/-> model  Enter=send  Esc/Ctrl+C=quit",
                 ),
             ]))
             .style(Style::default().fg(Color::White).bg(Color::DarkGray));
-            frame.render_widget(bar, chunks[3]);
+            frame.render_widget(bar, chunks[4]);
 
             let usage_bar = Paragraph::new(Line::from(vec![
                 Span::styled("Usage: ", Style::default().fg(Color::Yellow)),
                 Span::raw(self.usage_status.clone()),
             ]))
             .style(Style::default().fg(Color::White).bg(Color::Black));
-            frame.render_widget(usage_bar, chunks[4]);
+            frame.render_widget(usage_bar, chunks[5]);
         });
     }
 
@@ -465,8 +595,33 @@ impl TuiLogSink {
     fn toggle_pane(&mut self) {
         self.active_pane = match self.active_pane {
             TuiPane::Logs => TuiPane::Prompt,
-            TuiPane::Prompt => TuiPane::Logs,
+            TuiPane::Prompt => TuiPane::Model,
+            TuiPane::Model => TuiPane::Logs,
         };
+        self.redraw();
+    }
+
+    fn configure_model_options(&mut self, executor: &ExecutorKind, selected_model: Option<&str>) {
+        self.model_config.configure(executor, selected_model);
+        self.redraw();
+    }
+
+    fn selected_model(&self) -> Option<String> {
+        self.model_config.selected_model()
+    }
+
+    fn cycle_model_next(&mut self) {
+        self.model_config.cycle_next();
+        self.redraw();
+    }
+
+    fn cycle_model_prev(&mut self) {
+        self.model_config.cycle_prev();
+        self.redraw();
+    }
+
+    fn mark_model_unavailable(&mut self) {
+        self.model_config.mark_unavailable();
         self.redraw();
     }
 
@@ -554,6 +709,7 @@ impl LogSink for TuiLogSink {
         self.status = "starting".to_string();
         self.agent_status = "Initializing".to_string();
         self.usage_status = UsageTracker::new(&options.executor).initial_status();
+        self.configure_model_options(&options.executor, options.model.as_deref());
         self.redraw();
     }
 
@@ -579,6 +735,10 @@ impl LogSink for TuiLogSink {
         self.redraw();
     }
 
+    fn on_model_unavailable(&mut self) {
+        self.mark_model_unavailable();
+    }
+
     fn on_exit(&mut self, code: Option<i32>) {
         self.status = format!("finished (exit={code:?})");
         if code == Some(0) {
@@ -597,8 +757,16 @@ impl LogSink for TuiLogSink {
             self.toggle_pane();
             return;
         }
-        if self.active_pane == TuiPane::Logs {
-            let _ = handle_logs_navigation_key(self, key);
+        match self.active_pane {
+            TuiPane::Logs => {
+                let _ = handle_logs_navigation_key(self, key);
+            }
+            TuiPane::Model => match key.code {
+                KeyCode::Left | KeyCode::Up => self.cycle_model_prev(),
+                KeyCode::Right | KeyCode::Down => self.cycle_model_next(),
+                _ => {}
+            },
+            TuiPane::Prompt => {}
         }
     }
 }
@@ -775,6 +943,45 @@ fn parse_executor(raw: &str) -> Result<ExecutorKind, CliError> {
     }
 }
 
+fn model_options_for_executor(executor: &ExecutorKind) -> Vec<String> {
+    match executor {
+        ExecutorKind::Codex => vec![
+            "gpt-5".to_string(),
+            "gpt-5-mini".to_string(),
+            "gpt-5-nano".to_string(),
+        ],
+        ExecutorKind::Claude => vec![
+            "claude-sonnet-4-5".to_string(),
+            "claude-opus-4-1".to_string(),
+            "claude-3-7-sonnet-latest".to_string(),
+        ],
+        ExecutorKind::CursorAgent => vec![
+            "gpt-5".to_string(),
+            "claude-sonnet-4-5".to_string(),
+            "gemini-2.5-pro".to_string(),
+        ],
+        ExecutorKind::Droid => vec![
+            "gpt-5".to_string(),
+            "gpt-5-mini".to_string(),
+            "gemini-2.5-pro".to_string(),
+        ],
+        ExecutorKind::Gemini => vec!["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()],
+        ExecutorKind::Opencode => vec![
+            "gpt-5".to_string(),
+            "claude-sonnet-4-5".to_string(),
+            "gemini-2.5-pro".to_string(),
+        ],
+        ExecutorKind::QwenCode => vec!["qwen3-coder-plus".to_string(), "qwen3-coder".to_string()],
+        ExecutorKind::Copilot => vec![
+            "gpt-4.1".to_string(),
+            "claude-sonnet-4-5".to_string(),
+            "o3".to_string(),
+        ],
+        ExecutorKind::Amp => Vec::new(),
+        ExecutorKind::Custom(_) => Vec::new(),
+    }
+}
+
 pub async fn run_with_default_sink(options: RunOptions) -> Result<RunOutcome, CliError> {
     let use_tui = options.tui && io::stdout().is_terminal();
     if use_tui {
@@ -794,7 +1001,10 @@ pub async fn run_executor(
 }
 
 enum TuiPromptAction {
-    Submit(String),
+    Submit {
+        prompt: String,
+        model: Option<String>,
+    },
     Quit,
 }
 
@@ -820,8 +1030,9 @@ async fn run_tui_session(
         sink.set_active_pane(TuiPane::Prompt);
         sink.on_status("awaiting prompt (Tab=switch, Enter=send, Esc/Ctrl+C=quit)");
         match read_tui_prompt_action(sink)? {
-            TuiPromptAction::Submit(prompt) => {
+            TuiPromptAction::Submit { prompt, model } => {
                 options.prompt = prompt;
+                options.model = model;
             }
             TuiPromptAction::Quit => {
                 outcome.user_requested_exit = true;
@@ -994,6 +1205,7 @@ enum DisplayEvent {
     Status(String),
     AgentStatus(String),
     UsageStatus(String),
+    ModelUnavailable,
 }
 
 struct LogFormatter {
@@ -1038,6 +1250,10 @@ impl LogFormatter {
                 return vec![DisplayEvent::Status(
                     "codex: suppressing noisy local rollout-path warnings".to_string(),
                 )];
+            }
+
+            if stream == LogStream::Stderr && Self::is_model_refresh_timeout(line) {
+                return vec![DisplayEvent::ModelUnavailable];
             }
 
             if let Some(formatted) = self.format_codex_event(line) {
@@ -1180,6 +1396,11 @@ impl LogFormatter {
         }
 
         Some(events)
+    }
+
+    fn is_model_refresh_timeout(line: &str) -> bool {
+        line.contains("failed to refresh available models")
+            && line.contains("timeout waiting for child process to exit")
     }
 }
 
@@ -1449,6 +1670,7 @@ pub async fn stream_spawned(
                         DisplayEvent::Status(status) => sink.on_status(&status),
                         DisplayEvent::AgentStatus(status) => sink.on_agent_status(&status),
                         DisplayEvent::UsageStatus(status) => sink.on_usage_status(&status),
+                        DisplayEvent::ModelUnavailable => sink.on_model_unavailable(),
                     }
                 }
             }
@@ -1591,11 +1813,37 @@ fn read_tui_prompt_action(sink: &mut TuiLogSink) -> io::Result<TuiPromptAction> 
                     continue;
                 }
 
+                if sink.active_pane() == TuiPane::Model {
+                    if is_prompt_quit_key(key) {
+                        sink.set_input_text(String::new());
+                        return Ok(TuiPromptAction::Quit);
+                    }
+                    match key.code {
+                        KeyCode::Left | KeyCode::Up => sink.cycle_model_prev(),
+                        KeyCode::Right | KeyCode::Down => sink.cycle_model_next(),
+                        KeyCode::Enter => {
+                            let prompt = input.trim();
+                            if !prompt.is_empty() {
+                                sink.set_input_text(String::new());
+                                return Ok(TuiPromptAction::Submit {
+                                    prompt: prompt.to_string(),
+                                    model: sink.selected_model(),
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match apply_prompt_input_key(&mut input, key) {
                     PromptInputUpdate::Continue => sink.set_input_text(input.clone()),
                     PromptInputUpdate::Submit(prompt) => {
                         sink.set_input_text(String::new());
-                        return Ok(TuiPromptAction::Submit(prompt));
+                        return Ok(TuiPromptAction::Submit {
+                            prompt,
+                            model: sink.selected_model(),
+                        });
                     }
                     PromptInputUpdate::Quit => {
                         sink.set_input_text(String::new());
@@ -1891,6 +2139,17 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(matches!(first[0], DisplayEvent::Status(_)));
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn codex_model_refresh_timeout_sets_model_unavailable_without_log_line() {
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let warning = "2026-02-23T10:45:31.760202Z ERROR codex_core::models_manager::manager: failed to refresh available models: timeout waiting for child process to exit";
+
+        let events = formatter.format(LogStream::Stderr, warning);
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], DisplayEvent::ModelUnavailable));
     }
 
     #[test]
