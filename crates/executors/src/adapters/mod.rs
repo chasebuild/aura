@@ -8,6 +8,7 @@ mod droid;
 mod gemini;
 mod local;
 mod opencode;
+mod ollama;
 mod qwen_code;
 
 pub use amp::{AmpOptions, amp, amp_default};
@@ -20,4 +21,5 @@ pub use droid::{DroidOptions, droid, droid_default};
 pub use gemini::{GeminiOptions, gemini, gemini_default};
 pub use local::{LocalOptions, local, local_default};
 pub use opencode::{OpencodeOptions, opencode, opencode_default};
+pub use ollama::{OllamaOptions, ollama_cli, ollama_default};
 pub use qwen_code::{QwenCodeOptions, qwen_code, qwen_code_default};

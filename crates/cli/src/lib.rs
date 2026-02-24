@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aura_contracts::{ExecutorKind, SessionId};
 use aura_executors::adapters::{
     AmpOptions, ClaudeOptions, CodexOptions, CopilotOptions, CursorAgentOptions, DroidOptions,
-    GeminiOptions, LocalOptions, OpencodeOptions, QwenCodeOptions,
+    GeminiOptions, LocalOptions, OllamaOptions, OpencodeOptions, QwenCodeOptions,
 };
 use aura_executors::{
     AppendPrompt, CmdOverrides, ExecutionEnv, ExecutorError, ExecutorProfileId, RepoContext,
@@ -52,6 +52,7 @@ pub struct RunOptions {
     pub append_prompt: Option<String>,
     pub model: Option<String>,
     pub openai_endpoint: Option<String>,
+    pub(crate) local_provider: Option<LocalProvider>,
     pub yolo: bool,
     pub force: bool,
     pub trust: bool,
@@ -99,6 +100,14 @@ struct ExecutorPathCache {
     entries: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LocalProvider {
+    Ollama,
+    LmStudio,
+    Custom,
+}
+
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
@@ -115,6 +124,7 @@ impl Default for RunOptions {
             append_prompt: None,
             model: None,
             openai_endpoint: None,
+            local_provider: None,
             yolo: false,
             force: false,
             trust: false,
@@ -267,8 +277,9 @@ impl ModelConfiguration {
         executor: &ExecutorKind,
         selected_model: Option<&str>,
         refresh_model_cache: bool,
+        local_provider: Option<LocalProvider>,
     ) {
-        self.options = model_options_for_executor(executor, refresh_model_cache);
+        self.options = model_options_for_executor(executor, refresh_model_cache, local_provider);
         self.unavailable = false;
 
         if let Some(model) = selected_model {
@@ -739,9 +750,10 @@ impl TuiLogSink {
         executor: &ExecutorKind,
         selected_model: Option<&str>,
         refresh_model_cache: bool,
+        local_provider: Option<LocalProvider>,
     ) {
         self.model_config
-            .configure(executor, selected_model, refresh_model_cache);
+            .configure(executor, selected_model, refresh_model_cache, local_provider);
         self.request_redraw(true);
     }
 
@@ -858,6 +870,7 @@ impl LogSink for TuiLogSink {
             &options.executor,
             options.model.as_deref(),
             options.refresh_model_cache,
+            options.local_provider,
         );
         self.request_redraw(true);
     }
@@ -1008,7 +1021,8 @@ enum ExecutorArg {
     Amp,
     Gemini,
     Opencode,
-    Local,
+    Ollama,
+    Lms,
     #[value(name = "qwen-code", alias = "qwen")]
     QwenCode,
     Copilot,
@@ -1074,10 +1088,20 @@ fn executor_kind_from_arg(value: ExecutorArg) -> ExecutorKind {
         ExecutorArg::Amp => ExecutorKind::Amp,
         ExecutorArg::Gemini => ExecutorKind::Gemini,
         ExecutorArg::Opencode => ExecutorKind::Opencode,
-        ExecutorArg::Local => ExecutorKind::Local,
+        ExecutorArg::Ollama => ExecutorKind::Local,
+        ExecutorArg::Lms => ExecutorKind::Local,
         ExecutorArg::QwenCode => ExecutorKind::QwenCode,
         ExecutorArg::Copilot => ExecutorKind::Copilot,
-        ExecutorArg::Custom => ExecutorKind::Custom("custom".to_string()),
+        ExecutorArg::Custom => ExecutorKind::Local,
+    }
+}
+
+fn local_provider_from_executor_arg(value: ExecutorArg) -> Option<LocalProvider> {
+    match value {
+        ExecutorArg::Ollama => Some(LocalProvider::Ollama),
+        ExecutorArg::Lms => Some(LocalProvider::LmStudio),
+        ExecutorArg::Custom => Some(LocalProvider::Custom),
+        _ => None,
     }
 }
 
@@ -1090,10 +1114,9 @@ fn normalize_executor_key(value: &str) -> Option<String> {
         "amp" => Some("amp".to_string()),
         "gemini" => Some("gemini".to_string()),
         "opencode" => Some("opencode".to_string()),
-        "local" => Some("local".to_string()),
+        "local" | "ollama" | "lms" | "custom" => Some("local".to_string()),
         "qwen-code" | "qwen" => Some("qwen-code".to_string()),
         "copilot" => Some("copilot".to_string()),
-        "custom" => Some("custom".to_string()),
         _ => None,
     }
 }
@@ -1137,6 +1160,25 @@ fn executor_path_override(
     overrides.get(key).cloned()
 }
 
+fn prompt_for_custom_endpoint() -> Result<String, CliError> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(CliError::Arg(
+            "custom executor requires --openai-endpoint when not running in a TTY".to_string(),
+        ));
+    }
+
+    let endpoint: String = cliclack::input("Custom OpenAI endpoint")
+        .placeholder("http://127.0.0.1:8000/v1")
+        .interact()
+        .map_err(|error| CliError::Runtime(format!("endpoint prompt failed: {error}")))?;
+
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::Arg("custom executor requires an endpoint".to_string()));
+    }
+    Ok(trimmed.to_string())
+}
+
 fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions, CliError> {
     let mut env_vars = HashMap::new();
     for pair in args.env_vars {
@@ -1155,6 +1197,7 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
         ));
     }
 
+    let local_provider = local_provider_from_executor_arg(args.executor);
     let mut session_id = args.session_id;
     if args.resume_latest {
         session_id = Some(latest_session_id().ok_or_else(|| {
@@ -1177,6 +1220,25 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
 
     let resume = args.resume_latest || session_id.is_some();
 
+    let mut openai_endpoint = args.openai_endpoint;
+    if let Some(provider) = local_provider {
+        openai_endpoint = match provider {
+            LocalProvider::Ollama => openai_endpoint,
+            LocalProvider::LmStudio => {
+                openai_endpoint.or(Some("http://127.0.0.1:1234".to_string()))
+            }
+            LocalProvider::Custom => openai_endpoint.or_else(|| {
+                prompt_for_custom_endpoint().ok()
+            }),
+        };
+
+        if matches!(provider, LocalProvider::Custom) && openai_endpoint.is_none() {
+            return Err(CliError::Arg(
+                "custom executor requires --openai-endpoint or interactive input".to_string(),
+            ));
+        }
+    }
+
     Ok(RunOptions {
         executor: executor_kind_from_arg(args.executor),
         prompt: args.prompt,
@@ -1192,7 +1254,8 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
         additional_params: args.additional_params,
         append_prompt: args.append_prompt,
         model: args.model,
-        openai_endpoint: args.openai_endpoint,
+        openai_endpoint,
+        local_provider,
         yolo: args.yolo,
         force: args.force,
         trust: args.trust,
@@ -1243,7 +1306,11 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, CliError> {
     }
 }
 
-fn model_options_for_executor(executor: &ExecutorKind, refresh_local_cache: bool) -> Vec<String> {
+fn model_options_for_executor(
+    executor: &ExecutorKind,
+    refresh_local_cache: bool,
+    local_provider: Option<LocalProvider>,
+) -> Vec<String> {
     match executor {
         ExecutorKind::Codex => vec![
             "gpt-5".to_string(),
@@ -1271,7 +1338,7 @@ fn model_options_for_executor(executor: &ExecutorKind, refresh_local_cache: bool
             "claude-sonnet-4-5".to_string(),
             "gemini-2.5-pro".to_string(),
         ],
-        ExecutorKind::Local => discover_local_model_options(refresh_local_cache),
+        ExecutorKind::Local => discover_local_model_options(refresh_local_cache, local_provider),
         ExecutorKind::QwenCode => vec!["qwen3-coder-plus".to_string(), "qwen3-coder".to_string()],
         ExecutorKind::Copilot => vec![
             "gpt-4.1".to_string(),
@@ -1283,9 +1350,23 @@ fn model_options_for_executor(executor: &ExecutorKind, refresh_local_cache: bool
     }
 }
 
-fn discover_local_model_options(refresh_cache: bool) -> Vec<String> {
+fn discover_local_model_options(
+    refresh_cache: bool,
+    local_provider: Option<LocalProvider>,
+) -> Vec<String> {
+    let sources = match local_provider {
+        Some(LocalProvider::Ollama) => vec!["ollama"],
+        Some(LocalProvider::LmStudio) => vec!["lmstudio"],
+        Some(LocalProvider::Custom) => Vec::new(),
+        None => vec!["ollama", "lmstudio"],
+    };
+
+    if sources.is_empty() {
+        return Vec::new();
+    }
+
     if !refresh_cache {
-        if let Some(cached) = load_model_cache() {
+        if let Some(cached) = load_model_cache(&sources) {
             return cached;
         }
     }
@@ -1293,22 +1374,26 @@ fn discover_local_model_options(refresh_cache: bool) -> Vec<String> {
     let mut options = Vec::new();
     let mut seen = HashSet::new();
 
-    for model in discover_ollama_models() {
-        let value = format!("ollama/{model}");
-        if seen.insert(value.clone()) {
-            options.push(value);
+    if sources.contains(&"ollama") {
+        for model in discover_ollama_models() {
+            let value = format!("ollama/{model}");
+            if seen.insert(value.clone()) {
+                options.push(value);
+            }
         }
     }
 
-    for model in discover_lmstudio_models() {
-        let value = format!("lmstudio/{model}");
-        if seen.insert(value.clone()) {
-            options.push(value);
+    if sources.contains(&"lmstudio") {
+        for model in discover_lmstudio_models() {
+            let value = format!("lmstudio/{model}");
+            if seen.insert(value.clone()) {
+                options.push(value);
+            }
         }
     }
 
     if !options.is_empty() {
-        write_model_cache(&options);
+        write_model_cache(&options, &sources);
     }
 
     options
@@ -1753,7 +1838,7 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn load_model_cache() -> Option<Vec<String>> {
+fn load_model_cache(expected_sources: &[&str]) -> Option<Vec<String>> {
     let path = model_cache_path();
     let Ok(raw) = fs::read_to_string(path) else {
         return None;
@@ -1762,6 +1847,11 @@ fn load_model_cache() -> Option<Vec<String>> {
         return None;
     };
     if cache.version != 1 {
+        return None;
+    }
+    let expected: HashSet<String> = expected_sources.iter().map(|value| value.to_string()).collect();
+    let actual: HashSet<String> = cache.sources.iter().cloned().collect();
+    if expected != actual {
         return None;
     }
     let age = now_epoch_secs().saturating_sub(cache.updated_at);
@@ -1774,7 +1864,7 @@ fn load_model_cache() -> Option<Vec<String>> {
     Some(cache.models)
 }
 
-fn write_model_cache(models: &[String]) {
+fn write_model_cache(models: &[String], sources: &[&str]) {
     let path = model_cache_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -1783,7 +1873,7 @@ fn write_model_cache(models: &[String]) {
         version: 1,
         updated_at: now_epoch_secs(),
         models: models.to_vec(),
-        sources: vec!["ollama".to_string(), "lmstudio".to_string()],
+        sources: sources.iter().map(|value| value.to_string()).collect(),
     };
     if let Ok(serialized) = serde_json::to_string(&cache) {
         let _ = fs::write(path, serialized);
@@ -2128,8 +2218,13 @@ fn ensure_local_model_selected(options: &mut RunOptions) -> Result<(), CliError>
         return Ok(());
     }
 
-    let models = discover_local_model_options(options.refresh_model_cache);
+    let models = discover_local_model_options(options.refresh_model_cache, options.local_provider);
     if models.is_empty() {
+        if matches!(options.local_provider, Some(LocalProvider::Custom)) {
+            return Err(CliError::Arg(
+                "custom executor: model is required; pass --model explicitly".to_string(),
+            ));
+        }
         return Err(CliError::Arg(
             "no local models discovered from Ollama or LM Studio; pass --model explicitly"
                 .to_string(),
@@ -2184,6 +2279,14 @@ async fn run_executor_inner(
     enable_keyboard_controls: bool,
 ) -> Result<RunOutcome, CliError> {
     let mut options = options;
+    if matches!(options.executor, ExecutorKind::Local)
+        && matches!(options.local_provider, Some(LocalProvider::Ollama))
+        && options.model.as_deref().map(str::trim).unwrap_or("").is_empty()
+    {
+        return Err(CliError::Arg(
+            "ollama executor: model is required; pass --model".to_string(),
+        ));
+    }
     if options.session_id.is_none() {
         if let Some(env_session) = options.env_vars.get("AURA_SESSION_ID") {
             options.session_id = Some(env_session.clone());
@@ -2332,6 +2435,16 @@ fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> 
             cmd_overrides,
         })),
         ExecutorKind::Local => {
+            if matches!(options.local_provider, Some(LocalProvider::Ollama)) {
+                let (model, _) =
+                    resolve_local_model_and_endpoint(options.model.as_deref(), None);
+                let model = model.unwrap_or_else(|| "llama3".to_string());
+                return Box::new(adapters::ollama_cli(OllamaOptions {
+                    append_prompt,
+                    model,
+                    cmd_overrides,
+                }));
+            }
             let mut local_cmd_overrides = cmd_overrides;
             if local_cmd_overrides.base_command_override.is_none() {
                 local_cmd_overrides.base_command_override = std::env::current_exe()
@@ -3195,11 +3308,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_local_executor() {
+    fn parses_ollama_executor() {
         let args = vec![
             "run".to_string(),
             "--executor".to_string(),
-            "local".to_string(),
+            "ollama".to_string(),
             "--prompt".to_string(),
             "hi".to_string(),
         ];
@@ -3208,6 +3321,7 @@ mod tests {
         match parsed {
             CliCommand::Run(opts) => {
                 assert!(matches!(opts.executor, ExecutorKind::Local));
+                assert!(matches!(opts.local_provider, Some(LocalProvider::Ollama)));
                 assert_eq!(opts.prompt, "hi");
             }
             _ => panic!("expected run"),
@@ -3215,11 +3329,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_local_openai_endpoint() {
+    fn parses_custom_openai_endpoint() {
         let args = vec![
             "run".to_string(),
             "--executor".to_string(),
-            "local".to_string(),
+            "custom".to_string(),
             "--prompt".to_string(),
             "hi".to_string(),
             "--openai-endpoint".to_string(),
@@ -3233,6 +3347,7 @@ mod tests {
                     opts.openai_endpoint.as_deref(),
                     Some("http://127.0.0.1:1234")
                 );
+                assert!(matches!(opts.local_provider, Some(LocalProvider::Custom)));
             }
             _ => panic!("expected run"),
         }
@@ -3626,6 +3741,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             append_prompt: None,
             model: None,
             openai_endpoint: None,
+            local_provider: None,
             yolo: false,
             force: false,
             trust: false,
@@ -3662,6 +3778,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             append_prompt: None,
             model: None,
             openai_endpoint: None,
+            local_provider: None,
             yolo: false,
             force: false,
             trust: false,
@@ -3693,6 +3810,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             append_prompt: None,
             model: None,
             openai_endpoint: None,
+            local_provider: None,
             yolo: true,
             force: false,
             trust: false,
