@@ -62,7 +62,7 @@ pub struct RunOptions {
 }
 
 #[derive(Debug, Clone)]
-struct SessionContext {
+pub(crate) struct SessionContext {
     session_id: String,
     executor: ExecutorKind,
     cwd: PathBuf,
@@ -963,11 +963,17 @@ struct AuraCli {
 enum AuraSubcommand {
     Run(RunCliArgs),
     Tui(RunCliArgs),
-    Session(SessionArgs),
+    Session(SessionCommand),
     Help,
     Completion(CompletionArgs),
     #[command(name = "local-exec", hide = true)]
     LocalExec,
+}
+
+#[derive(Debug, Args)]
+struct SessionCommand {
+    #[command(subcommand)]
+    command: SessionArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -983,7 +989,7 @@ struct SessionShowArgs {
 }
 
 #[derive(Debug, Args, Clone)]
-struct SessionListArgs {
+pub struct SessionListArgs {
     #[arg(long, value_enum)]
     executor: Option<ExecutorArg>,
     #[arg(long)]
@@ -1151,9 +1157,9 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
 
     let mut session_id = args.session_id;
     if args.resume_latest {
-        session_id = latest_session_id().ok_or_else(|| {
+        session_id = Some(latest_session_id().ok_or_else(|| {
             CliError::Arg("no saved sessions found for --resume-latest".to_string())
-        })?;
+        })?);
     }
 
     let mut executor_paths = load_executor_path_cache().entries;
@@ -1169,6 +1175,8 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
         });
     }
 
+    let resume = args.resume_latest || session_id.is_some();
+
     Ok(RunOptions {
         executor: executor_kind_from_arg(args.executor),
         prompt: args.prompt,
@@ -1176,7 +1184,7 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
             .cwd
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         session_id,
-        resume: args.resume_latest || session_id.is_some(),
+        resume,
         refresh_model_cache: args.refresh_model_cache,
         review: args.review,
         env_vars,
@@ -1222,11 +1230,13 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, CliError> {
         AuraSubcommand::Tui(run_args) => Ok(CliCommand::Run(Box::new(convert_run_cli_args(
             run_args, true,
         )?))),
-        AuraSubcommand::Session(SessionArgs::List(args)) => Ok(CliCommand::SessionList(args)),
-        AuraSubcommand::Session(SessionArgs::Show(args)) => Ok(CliCommand::SessionShow {
-            session_id: args.session_id,
-        }),
-        AuraSubcommand::Session(SessionArgs::Latest) => Ok(CliCommand::SessionLatest),
+        AuraSubcommand::Session(session) => match session.command {
+            SessionArgs::List(args) => Ok(CliCommand::SessionList(args)),
+            SessionArgs::Show(args) => Ok(CliCommand::SessionShow {
+                session_id: args.session_id,
+            }),
+            SessionArgs::Latest => Ok(CliCommand::SessionLatest),
+        },
         AuraSubcommand::Help => Ok(CliCommand::Help),
         AuraSubcommand::Completion(args) => Ok(CliCommand::Completion { shell: args.shell }),
         AuraSubcommand::LocalExec => Ok(CliCommand::LocalExec),
@@ -2260,10 +2270,7 @@ async fn run_executor_inner(
 fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> {
     let executor_override = executor_path_override(&options.executor, &options.executor_paths);
     let cmd_overrides = CmdOverrides {
-        base_command_override: options
-            .base_command_override
-            .clone()
-            .or(executor_override),
+        base_command_override: options.base_command_override.clone().or(executor_override),
         additional_params: if options.additional_params.is_empty() {
             None
         } else {
@@ -2763,7 +2770,7 @@ fn summarize_text(text: &str, max_len: usize) -> String {
     }
 }
 
-pub async fn stream_spawned(
+pub(crate) async fn stream_spawned(
     executor_kind: ExecutorKind,
     session_context: Option<SessionContext>,
     mut spawned: SpawnedChild,
