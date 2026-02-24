@@ -23,10 +23,6 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use duct::cmd;
-use pulldown_cmark::{
-    Event as MdEvent, HeadingLevel as MdHeadingLevel, Options as MdOptions, Parser as MdParser,
-    Tag as MdTag, TagEnd as MdTagEnd,
-};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -55,6 +51,7 @@ pub struct RunOptions {
     pub additional_params: Vec<String>,
     pub append_prompt: Option<String>,
     pub model: Option<String>,
+    pub executor_mode: Option<String>,
     pub openai_endpoint: Option<String>,
     pub(crate) local_provider: Option<LocalProvider>,
     pub yolo: bool,
@@ -127,6 +124,7 @@ impl Default for RunOptions {
             additional_params: Vec::new(),
             append_prompt: None,
             model: None,
+            executor_mode: None,
             openai_endpoint: None,
             local_provider: None,
             yolo: false,
@@ -174,7 +172,16 @@ pub trait LogSink {
     fn on_model_unavailable(&mut self) {}
     fn flush(&mut self) {}
     fn on_exit(&mut self, code: Option<i32>);
-    fn on_key_event(&mut self, _key: KeyEvent) {}
+    fn on_key_event(&mut self, _key: KeyEvent) -> SinkKeyAction {
+        SinkKeyAction::None
+    }
+    fn on_paste(&mut self, _text: &str) {}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkKeyAction {
+    None,
+    RequestQuit,
 }
 
 pub struct PlainLogSink;
@@ -222,11 +229,16 @@ pub struct TuiLogSink {
     max_lines: usize,
     log_scroll: usize,
     title: String,
+    task_summary: String,
     status: String,
     agent_status: String,
     usage_status: String,
     input_text: String,
+    queued_prompts: VecDeque<TuiPromptSubmission>,
+    queue_cursor: usize,
     active_pane: TuiPane,
+    executor: Option<ExecutorKind>,
+    executor_mode: Option<String>,
     model_config: ModelConfiguration,
     last_redraw: Instant,
     redraw_interval: Duration,
@@ -251,6 +263,7 @@ enum TuiLineKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiPane {
     Logs,
+    Queue,
     Prompt,
     Model,
 }
@@ -259,6 +272,13 @@ enum TuiPane {
 struct TuiLogEntry {
     kind: TuiLineKind,
     text: String,
+}
+
+#[derive(Debug, Clone)]
+struct TuiPromptSubmission {
+    prompt: String,
+    model: Option<String>,
+    mode: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +364,31 @@ impl ModelConfiguration {
     fn has_options(&self) -> bool {
         !self.options.is_empty()
     }
+
+    fn select_by_label(&mut self, value: &str) -> bool {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if let Some(index) = self
+            .options
+            .iter()
+            .position(|option| option.eq_ignore_ascii_case(trimmed))
+        {
+            self.selected_index = index;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_by_ordinal(&mut self, ordinal: usize) -> bool {
+        if ordinal == 0 || ordinal > self.options.len() {
+            return false;
+        }
+        self.selected_index = ordinal - 1;
+        true
+    }
 }
 
 fn classify_tui_line(stream: LogStream, line: &str) -> TuiLineKind {
@@ -399,181 +444,6 @@ fn normalize_tui_line_text(kind: TuiLineKind, line: &str) -> String {
     sanitize_tui_text(&normalized)
 }
 
-fn render_markdown_lines(text: &str) -> Vec<Line<'static>> {
-    let mut options = MdOptions::empty();
-    options.insert(MdOptions::ENABLE_STRIKETHROUGH);
-    options.insert(MdOptions::ENABLE_TABLES);
-    let parser = MdParser::new_ext(text, options);
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current: Vec<Span<'static>> = Vec::new();
-    let mut style_stack: Vec<Style> = vec![Style::default().fg(Color::White)];
-    let mut in_codeblock = false;
-    let code_style = Style::default().fg(Color::Green);
-    let mut list_stack: Vec<(bool, usize)> = Vec::new();
-    let mut blockquote_depth: usize = 0;
-
-    let push_line = |lines: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>| {
-        if current.is_empty() {
-            return;
-        }
-        lines.push(Line::from(std::mem::take(current)));
-    };
-
-    let push_blank = |lines: &mut Vec<Line<'static>>| {
-        lines.push(Line::from(Span::raw("")));
-    };
-
-    for event in parser {
-        match event {
-            MdEvent::Start(tag) => match tag {
-                MdTag::Paragraph => {}
-                MdTag::Heading { level, .. } => {
-                    push_line(&mut lines, &mut current);
-                    let style = Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(ratatui::style::Modifier::BOLD);
-                    style_stack.push(style);
-                    current.push(Span::raw(format!(
-                        "{} ",
-                        "#".repeat(heading_level_to_usize(level))
-                    )));
-                }
-                MdTag::BlockQuote => {
-                    blockquote_depth += 1;
-                }
-                MdTag::List(start) => {
-                    let ordered = start.is_some();
-                    let index = start.unwrap_or(0) as usize;
-                    list_stack.push((ordered, index));
-                }
-                MdTag::Item => {
-                    if let Some((ordered, index)) = list_stack.last_mut() {
-                        let prefix = if *ordered {
-                            let num = *index + 1;
-                            *index += 1;
-                            format!("{num}. ")
-                        } else {
-                            "• ".to_string()
-                        };
-                        current.push(Span::styled(prefix, Style::default().fg(Color::White)));
-                    }
-                }
-                MdTag::Emphasis => {
-                    let style = style_stack
-                        .last()
-                        .copied()
-                        .unwrap_or_default()
-                        .add_modifier(ratatui::style::Modifier::ITALIC);
-                    style_stack.push(style);
-                }
-                MdTag::Strong => {
-                    let style = style_stack
-                        .last()
-                        .copied()
-                        .unwrap_or_default()
-                        .add_modifier(ratatui::style::Modifier::BOLD);
-                    style_stack.push(style);
-                }
-                MdTag::Strikethrough => {
-                    let style = style_stack
-                        .last()
-                        .copied()
-                        .unwrap_or_default()
-                        .add_modifier(ratatui::style::Modifier::CROSSED_OUT);
-                    style_stack.push(style);
-                }
-                MdTag::CodeBlock(_) => {
-                    push_line(&mut lines, &mut current);
-                    in_codeblock = true;
-                }
-                MdTag::Link { .. } => {
-                    let style = style_stack
-                        .last()
-                        .copied()
-                        .unwrap_or_default()
-                        .fg(Color::Cyan)
-                        .add_modifier(ratatui::style::Modifier::UNDERLINED);
-                    style_stack.push(style);
-                }
-                _ => {}
-            },
-            MdEvent::End(tag) => match tag {
-                MdTagEnd::Paragraph => {
-                    push_line(&mut lines, &mut current);
-                    push_blank(&mut lines);
-                }
-                MdTagEnd::Heading(_) => {
-                    push_line(&mut lines, &mut current);
-                    push_blank(&mut lines);
-                    style_stack.pop();
-                }
-                MdTagEnd::BlockQuote => {
-                    blockquote_depth = blockquote_depth.saturating_sub(1);
-                }
-                MdTagEnd::List(_) => {
-                    list_stack.pop();
-                    push_blank(&mut lines);
-                }
-                MdTagEnd::Item => {
-                    push_line(&mut lines, &mut current);
-                }
-                MdTagEnd::Emphasis
-                | MdTagEnd::Strong
-                | MdTagEnd::Strikethrough
-                | MdTagEnd::Link => {
-                    style_stack.pop();
-                }
-                MdTagEnd::CodeBlock => {
-                    in_codeblock = false;
-                    push_blank(&mut lines);
-                }
-                _ => {}
-            },
-            MdEvent::Text(text) => {
-                if in_codeblock {
-                    for line in text.lines() {
-                        lines.push(Line::from(Span::styled(line.to_string(), code_style)));
-                    }
-                } else {
-                    if blockquote_depth > 0 && current.is_empty() {
-                        current.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
-                    }
-                    current.push(Span::styled(
-                        text.to_string(),
-                        style_stack.last().copied().unwrap_or_default(),
-                    ));
-                }
-            }
-            MdEvent::Code(code) => {
-                let style = Style::default().fg(Color::Yellow);
-                current.push(Span::styled(code.to_string(), style));
-            }
-            MdEvent::SoftBreak | MdEvent::HardBreak => {
-                push_line(&mut lines, &mut current);
-            }
-            _ => {}
-        }
-    }
-
-    if !current.is_empty() {
-        lines.push(Line::from(current));
-    }
-
-    lines
-}
-
-fn heading_level_to_usize(level: MdHeadingLevel) -> usize {
-    match level {
-        MdHeadingLevel::H1 => 1,
-        MdHeadingLevel::H2 => 2,
-        MdHeadingLevel::H3 => 3,
-        MdHeadingLevel::H4 => 4,
-        MdHeadingLevel::H5 => 5,
-        MdHeadingLevel::H6 => 6,
-    }
-}
-
 fn normalize_thinking_text(text: &str) -> String {
     text.replace("**", "").replace("__", "")
 }
@@ -625,6 +495,38 @@ fn sanitize_tui_text(input: &str) -> String {
     out
 }
 
+fn normalize_executor_mode(mode: Option<&str>) -> Option<String> {
+    mode.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_ascii_lowercase())
+        }
+    })
+}
+
+fn mode_display(mode: Option<&str>) -> String {
+    match normalize_executor_mode(mode) {
+        None => "execute".to_string(),
+        Some(value) => value,
+    }
+}
+
+fn executor_supports_mode(executor: &ExecutorKind, mode: &str) -> bool {
+    match normalize_executor_mode(Some(mode)).as_deref() {
+        None | Some("execute") | Some("default") => true,
+        Some("plan") | Some("yolo") => matches!(
+            executor,
+            ExecutorKind::Codex | ExecutorKind::Claude | ExecutorKind::Opencode
+        ),
+        Some("approvals") | Some("approval") => {
+            matches!(executor, ExecutorKind::Claude | ExecutorKind::Opencode)
+        }
+        Some(_) => matches!(executor, ExecutorKind::Opencode),
+    }
+}
+
 impl TuiLogSink {
     pub fn new() -> Self {
         let terminal = Self::init_terminal();
@@ -632,17 +534,22 @@ impl TuiLogSink {
         Self {
             started_at: now,
             lines: VecDeque::new(),
-            max_lines: 500,
+            max_lines: 5_000,
             log_scroll: 0,
             title: "AURA Executor".to_string(),
+            task_summary: "No task yet".to_string(),
             status: "starting".to_string(),
             agent_status: "Initializing".to_string(),
             usage_status: "Usage: -- | Cost: --".to_string(),
             input_text: String::new(),
+            queued_prompts: VecDeque::new(),
+            queue_cursor: 0,
             active_pane: TuiPane::Prompt,
+            executor: None,
+            executor_mode: None,
             model_config: ModelConfiguration::new(),
             last_redraw: now,
-            redraw_interval: Duration::from_millis(33),
+            redraw_interval: Duration::from_millis(16),
             pending_redraw: false,
             terminal,
         }
@@ -665,8 +572,9 @@ impl TuiLogSink {
         let Some(terminal) = self.terminal.as_mut() else {
             let _ = writeln!(
                 io::stdout(),
-                "{} | uptime={:.1?} | status={} | agent={}",
+                "{} | task={} | uptime={:.1?} | status={} | agent={}",
                 self.title,
+                self.task_summary,
                 self.started_at.elapsed(),
                 self.status,
                 self.agent_status
@@ -680,29 +588,109 @@ impl TuiLogSink {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
+                    Constraint::Length(3),
                     Constraint::Min(6),
-                    Constraint::Length(3),
-                    Constraint::Length(3),
-                    Constraint::Length(1),
+                    Constraint::Length(4),
+                    Constraint::Length(4),
                     Constraint::Length(1),
                 ])
                 .split(size);
 
-            let header = Paragraph::new(vec![
-                Line::from(Span::styled(
-                    self.title.clone(),
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(format!(
-                    "uptime: {:.1?} | status: {}",
-                    self.started_at.elapsed(),
-                    self.status
-                )),
+            let topbar = Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        " AURA ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(self.title.clone(), Style::default().fg(Color::White)),
+                    Span::raw("  "),
+                    Span::styled("agent:", Style::default().fg(Color::Gray)),
+                    Span::raw(" "),
+                    Span::styled(self.agent_status.clone(), Style::default().fg(Color::White)),
+                    Span::raw("  "),
+                    Span::styled("mode:", Style::default().fg(Color::Gray)),
+                    Span::raw(" "),
+                    Span::styled(
+                        mode_display(self.executor_mode.as_deref()),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("queue:", Style::default().fg(Color::Gray)),
+                    Span::raw(" "),
+                    Span::styled(
+                        self.queued_prompts.len().to_string(),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("status:", Style::default().fg(Color::Gray)),
+                    Span::raw(" "),
+                    Span::styled(self.status.clone(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("usage:", Style::default().fg(Color::Gray)),
+                    Span::raw(" "),
+                    Span::styled(self.usage_status.clone(), Style::default().fg(Color::White)),
+                ]),
             ])
-            .block(Block::default().borders(Borders::ALL).title("AURA"));
-            frame.render_widget(header, chunks[0]);
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(Color::DarkGray));
+            frame.render_widget(topbar, chunks[0]);
 
-            let logs_capacity = chunks[1].height.saturating_sub(2) as usize;
+            let task_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(20), Constraint::Length(26)])
+                .split(chunks[1]);
+
+            let task_title = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!("# {}", self.task_summary),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(vec![
+                    Span::styled("status ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(self.status.clone(), Style::default().fg(Color::White)),
+                ]),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .wrap(Wrap { trim: false });
+            frame.render_widget(task_title, task_chunks[0]);
+
+            let task_meta = Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("uptime ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:.1?}", self.started_at.elapsed()),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("focus ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:?}", self.active_pane).to_lowercase(),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .wrap(Wrap { trim: false });
+            frame.render_widget(task_meta, task_chunks[1]);
+
+            let logs_capacity = chunks[2].height.saturating_sub(2) as usize;
             let max_log_scroll = self.lines.len().saturating_sub(logs_capacity);
             let scroll = self.log_scroll.min(max_log_scroll);
             let end = self.lines.len().saturating_sub(scroll);
@@ -714,94 +702,83 @@ impl TuiLogSink {
                 .take(end - start)
                 .cloned()
                 .collect();
-            let mut log_lines: Vec<Line> = Vec::new();
+            let mut log_lines: Vec<Line<'static>> = Vec::new();
             for entry in visible_logs {
                 match entry.kind {
                     TuiLineKind::User => log_lines.push(Line::from(vec![
-                        Span::styled(" USER ", Style::default().fg(Color::Black).bg(Color::White)),
-                        Span::raw(" "),
-                        Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Gray)),
-                        Span::styled(entry.text, Style::default().fg(Color::Black).bg(Color::Gray)),
-                        Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Gray)),
-                    ])),
-                    TuiLineKind::Agent => log_lines.push(Line::from(vec![
-                        Span::styled(" AGENT ", Style::default().fg(Color::White)),
-                        Span::raw(" "),
-                        Span::styled(" ", Style::default().fg(Color::White)),
-                        Span::styled(entry.text, Style::default().fg(Color::White)),
-                        Span::styled(" ", Style::default().fg(Color::White)),
-                    ])),
-                    TuiLineKind::AgentMarkdown => {
-                        let rendered = render_markdown_lines(&entry.text);
-                        if rendered.is_empty() {
-                            continue;
-                        }
-                        log_lines.push(Line::from(vec![
-                            Span::styled(" AGENT ", Style::default().fg(Color::White)),
-                            Span::raw(" "),
-                            Span::styled(" ", Style::default().fg(Color::White)),
-                        ]));
-                        log_lines.extend(rendered);
-                    }
-                    TuiLineKind::Code => log_lines.push(Line::from(vec![
+                        Span::styled("│ ", Style::default().fg(Color::Cyan)),
                         Span::styled(
-                            " CODE ",
+                            entry.text,
                             Style::default().fg(Color::White).bg(Color::DarkGray),
                         ),
-                        Span::raw(" "),
-                        Span::styled(entry.text, Style::default().fg(Color::Gray)),
+                    ])),
+                    TuiLineKind::Agent => log_lines.push(Line::from(Span::styled(
+                        entry.text,
+                        Style::default().fg(Color::White),
+                    ))),
+                    TuiLineKind::AgentMarkdown => {
+                        for (index, line) in entry.text.lines().enumerate() {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            let content = sanitize_tui_text(line);
+                            if index == 0 {
+                                log_lines.push(Line::from(vec![
+                                    Span::styled("assistant ", Style::default().fg(Color::DarkGray)),
+                                    Span::styled(content, Style::default().fg(Color::White)),
+                                ]));
+                            } else {
+                                log_lines.push(Line::from(Span::styled(
+                                    content,
+                                    Style::default().fg(Color::White),
+                                )));
+                            }
+                        }
+                    }
+                    TuiLineKind::Code => log_lines.push(Line::from(vec![
+                        Span::styled("> ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(entry.text, Style::default().fg(Color::Cyan)),
                     ])),
                     TuiLineKind::Json => log_lines.push(Line::from(vec![
-                        Span::styled(" JSON ", Style::default().fg(Color::Black).bg(Color::Green)),
-                        Span::raw(" "),
+                        Span::styled("> ", Style::default().fg(Color::DarkGray)),
                         Span::styled(entry.text, Style::default().fg(Color::Green)),
                     ])),
                     TuiLineKind::Diff => log_lines.push(Line::from(vec![
-                        Span::styled(
-                            " DIFF ",
-                            Style::default().fg(Color::White).bg(Color::Magenta),
-                        ),
-                        Span::raw(" "),
+                        Span::styled("> ", Style::default().fg(Color::DarkGray)),
                         Span::styled(entry.text.clone(), diff_line_style(&entry.text)),
                     ])),
                     TuiLineKind::Thinking => log_lines.push(Line::from(vec![
+                        Span::styled("~ ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
-                            " THINK ",
-                            Style::default().fg(Color::Black).bg(Color::Yellow),
+                            entry.text,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(ratatui::style::Modifier::ITALIC),
                         ),
-                        Span::raw(" "),
-                        Span::styled(entry.text, Style::default().fg(Color::Yellow)),
                     ])),
                     TuiLineKind::Action => log_lines.push(Line::from(vec![
-                        Span::styled(
-                            " ACTION ",
-                            Style::default().fg(Color::White).bg(Color::Blue),
-                        ),
-                        Span::raw(" "),
+                        Span::styled("* ", Style::default().fg(Color::DarkGray)),
                         Span::styled(entry.text, Style::default().fg(Color::Blue)),
                     ])),
                     TuiLineKind::Error => log_lines.push(Line::from(vec![
-                        Span::styled(" ERROR ", Style::default().fg(Color::White).bg(Color::Red)),
-                        Span::raw(" "),
+                        Span::styled("! ", Style::default().fg(Color::Red)),
                         Span::styled(entry.text, Style::default().fg(Color::Red)),
                     ])),
-                    TuiLineKind::Output => log_lines.push(Line::from(vec![
-                        Span::styled(" OUT ", Style::default().fg(Color::Black).bg(Color::Green)),
-                        Span::raw(" "),
-                        Span::raw(entry.text),
-                    ])),
+                    TuiLineKind::Output => {
+                        log_lines.push(Line::from(Span::styled(entry.text, Style::default().fg(Color::Gray))))
+                    }
                 }
             }
 
             let logs_title = if max_log_scroll == 0 {
-                "Logs".to_string()
+                "Conversation".to_string()
             } else {
-                format!("Logs ({}/{})", scroll, max_log_scroll)
+                format!("Conversation ({}/{})", scroll, max_log_scroll)
             };
             let logs_border = if self.active_pane == TuiPane::Logs {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(Color::Cyan)
             } else {
-                Style::default()
+                Style::default().fg(Color::DarkGray)
             };
             let logs = Paragraph::new(Text::from(log_lines))
                 .block(
@@ -811,99 +788,142 @@ impl TuiLogSink {
                         .border_style(logs_border),
                 )
                 .wrap(Wrap { trim: false });
-            frame.render_widget(logs, chunks[1]);
+            frame.render_widget(logs, chunks[2]);
 
-            let prompt_text = if self.input_text.is_empty() {
-                Text::from(Line::from(Span::styled(
-                    "Type a follow-up prompt and press Enter",
+            let queue_border = if self.active_pane == TuiPane::Queue {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let queue_lines: Vec<Line<'static>> = if self.queued_prompts.is_empty() {
+                vec![Line::from(Span::styled(
+                    "No queued prompts. Enter text in Composer and press Enter to queue.",
                     Style::default().fg(Color::DarkGray),
-                )))
+                ))]
             } else {
-                Text::from(self.input_text.clone())
+                self.queued_prompts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let marker = if index == self.queue_cursor {
+                            if self.active_pane == TuiPane::Queue {
+                                "▶ "
+                            } else {
+                                "• "
+                            }
+                        } else {
+                            "  "
+                        };
+                        Line::from(vec![
+                            Span::styled(marker, Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                format!("{}.", index + 1),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::raw(" "),
+                            Span::styled(
+                                summarize_text(&item.prompt, 120),
+                                Style::default().fg(Color::White),
+                            ),
+                        ])
+                    })
+                    .collect()
             };
-            let prompt_border = if self.active_pane == TuiPane::Prompt {
-                Style::default().fg(Color::Yellow)
+            let queue_title = if self.queued_prompts.is_empty() {
+                "Queue".to_string()
             } else {
-                Style::default()
+                format!(
+                    "Queue ({})  Del/Backspace: remove selected",
+                    self.queued_prompts.len()
+                )
             };
-            let prompt = Paragraph::new(prompt_text)
+            let queue = Paragraph::new(Text::from(queue_lines))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title("Prompt")
-                        .border_style(prompt_border),
+                        .title(queue_title)
+                        .border_style(queue_border),
                 )
                 .wrap(Wrap { trim: false });
-            frame.render_widget(prompt, chunks[2]);
+            frame.render_widget(queue, chunks[3]);
 
-            let model_border = if self.active_pane == TuiPane::Model {
-                Style::default().fg(Color::Yellow)
+            let prompt_text = if self.input_text.is_empty() {
+                Line::from(Span::styled(
+                    "Type a follow-up prompt and press Enter",
+                    Style::default().fg(Color::DarkGray),
+                ))
             } else {
-                Style::default()
+                Line::from(Span::styled(
+                    self.input_text.clone(),
+                    Style::default().fg(Color::White),
+                ))
             };
-            let model_text = if !self.model_config.has_options() {
-                Text::from(Line::from(vec![
-                    Span::styled("n/a", Style::default().fg(Color::DarkGray)),
-                    Span::raw("  "),
-                    Span::styled(
-                        "(model override unsupported for this executor)",
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]))
+            let model_line = if !self.model_config.has_options() {
+                Line::from(Span::styled(
+                    "model: n/a (override unsupported for this executor)",
+                    Style::default().fg(Color::DarkGray),
+                ))
             } else {
                 let selected = self
                     .model_config
                     .selected_label()
                     .unwrap_or_else(|| "n/a".to_string());
-                let choices = self.model_config.choices_label();
-                Text::from(vec![
+                let choices = summarize_text(&self.model_config.choices_label(), 80);
+                if self.active_pane == TuiPane::Model {
                     Line::from(vec![
-                        Span::styled("selected: ", Style::default().fg(Color::Yellow)),
-                        Span::styled(selected, Style::default().fg(Color::White)),
-                    ]),
-                    Line::from(vec![
+                        Span::styled("model < ", Style::default().fg(Color::Cyan)),
+                        Span::styled(
+                            selected,
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(ratatui::style::Modifier::BOLD),
+                        ),
+                        Span::styled(" >  ", Style::default().fg(Color::Cyan)),
                         Span::styled("choices: ", Style::default().fg(Color::DarkGray)),
                         Span::styled(choices, Style::default().fg(Color::Gray)),
-                    ]),
-                ])
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled("model ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(selected, Style::default().fg(Color::White)),
+                        Span::styled("  (Tab to focus)", Style::default().fg(Color::DarkGray)),
+                    ])
+                }
             };
-            let model = Paragraph::new(model_text)
+            let composer_border = if self.active_pane == TuiPane::Prompt {
+                Style::default().fg(Color::Cyan)
+            } else if self.active_pane == TuiPane::Model {
+                Style::default().fg(Color::Blue)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let composer = Paragraph::new(Text::from(vec![prompt_text, model_line]))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title("Model")
-                        .border_style(model_border),
+                        .title("Composer")
+                        .border_style(composer_border),
                 )
                 .wrap(Wrap { trim: false });
-            frame.render_widget(model, chunks[3]);
+            frame.render_widget(composer, chunks[4]);
 
             let pane_text = match self.active_pane {
                 TuiPane::Logs => "Logs",
+                TuiPane::Queue => "Queue",
                 TuiPane::Prompt => "Prompt",
                 TuiPane::Model => "Model",
             };
-            let bar = Paragraph::new(Line::from(vec![
-                Span::styled("Run: ", Style::default().fg(Color::Yellow)),
-                Span::raw(self.status.clone()),
+            let footer = Paragraph::new(Line::from(vec![
+                Span::styled("focus ", Style::default().fg(Color::DarkGray)),
+                Span::styled(pane_text, Style::default().fg(Color::Cyan)),
                 Span::raw("  |  "),
-                Span::styled("Agent: ", Style::default().fg(Color::Yellow)),
-                Span::raw(self.agent_status.clone()),
-                Span::raw("  |  "),
-                Span::styled("Pane: ", Style::default().fg(Color::Yellow)),
-                Span::raw(pane_text),
-                Span::raw(
-                    "  |  Tab=switch  Arrows/Page/Home/End=scroll  <-/-> model  Enter=send  Esc/Ctrl+C=quit",
+                Span::styled(
+                    "Tab switch  Queue: Up/Down+Del  Logs: Arrows/Page/Home/End  <-/-> model  Enter queue/send  Esc/Ctrl+C quit",
+                    Style::default().fg(Color::Gray),
                 ),
             ]))
-            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
-            frame.render_widget(bar, chunks[4]);
-
-            let usage_bar = Paragraph::new(Line::from(vec![
-                Span::styled("Usage: ", Style::default().fg(Color::Yellow)),
-                Span::raw(self.usage_status.clone()),
-            ]))
-            .style(Style::default().fg(Color::White).bg(Color::Black));
-            frame.render_widget(usage_bar, chunks[5]);
+            .style(Style::default().fg(Color::Gray).bg(Color::Black));
+            frame.render_widget(footer, chunks[5]);
         });
     }
 
@@ -918,23 +938,15 @@ impl TuiLogSink {
         }
     }
 
-    fn set_input_text(&mut self, input: String) {
-        self.input_text = input;
-        self.redraw();
-    }
-
     fn set_active_pane(&mut self, pane: TuiPane) {
         self.active_pane = pane;
         self.redraw();
     }
 
-    fn active_pane(&self) -> TuiPane {
-        self.active_pane
-    }
-
     fn toggle_pane(&mut self) {
         self.active_pane = match self.active_pane {
-            TuiPane::Logs => TuiPane::Prompt,
+            TuiPane::Logs => TuiPane::Queue,
+            TuiPane::Queue => TuiPane::Prompt,
             TuiPane::Prompt => TuiPane::Model,
             TuiPane::Model => TuiPane::Logs,
         };
@@ -1027,6 +1039,199 @@ impl TuiLogSink {
         self.push_log_entry(TuiLineKind::User, summarize_text(prompt, 240));
         self.redraw();
     }
+
+    fn handle_prompt_edit_key(&mut self, key: KeyEvent) -> SinkKeyAction {
+        match apply_prompt_input_key(&mut self.input_text, key) {
+            PromptInputUpdate::Continue => {
+                self.request_redraw(true);
+                SinkKeyAction::None
+            }
+            PromptInputUpdate::Submit(prompt) => {
+                self.input_text.clear();
+                self.on_prompt_submit(prompt);
+                SinkKeyAction::None
+            }
+            PromptInputUpdate::Quit => SinkKeyAction::RequestQuit,
+        }
+    }
+
+    fn on_prompt_submit(&mut self, prompt: String) {
+        let normalized_prompt = if prompt.starts_with("//") {
+            prompt.trim_start_matches('/').to_string()
+        } else {
+            prompt
+        };
+
+        if self.handle_slash_command(&normalized_prompt) {
+            return;
+        }
+        let summary = summarize_text(&normalized_prompt, 240);
+        self.queued_prompts.push_back(TuiPromptSubmission {
+            prompt: normalized_prompt,
+            model: self.selected_model(),
+            mode: self.executor_mode.clone(),
+        });
+        self.clamp_queue_cursor();
+        self.push_log_entry(TuiLineKind::Action, format!("queued: {summary}"));
+        self.status = format!("queued {} prompt(s)", self.queued_prompts.len());
+        self.request_redraw(true);
+    }
+
+    fn take_queued_prompt(&mut self) -> Option<TuiPromptSubmission> {
+        let item = self.queued_prompts.pop_front();
+        self.clamp_queue_cursor();
+        item
+    }
+
+    fn clamp_queue_cursor(&mut self) {
+        if self.queued_prompts.is_empty() {
+            self.queue_cursor = 0;
+        } else {
+            self.queue_cursor = self.queue_cursor.min(self.queued_prompts.len() - 1);
+        }
+    }
+
+    fn queue_select_prev(&mut self) {
+        if self.queued_prompts.is_empty() || self.queue_cursor == 0 {
+            return;
+        }
+        self.queue_cursor -= 1;
+        self.request_redraw(true);
+    }
+
+    fn queue_select_next(&mut self) {
+        if self.queued_prompts.is_empty() {
+            return;
+        }
+        self.queue_cursor = (self.queue_cursor + 1).min(self.queued_prompts.len() - 1);
+        self.request_redraw(true);
+    }
+
+    fn remove_selected_queued_prompt(&mut self) {
+        if self.queued_prompts.is_empty() {
+            self.status = "queue is already empty".to_string();
+            self.request_redraw(true);
+            return;
+        }
+        let removed = self.queued_prompts.remove(self.queue_cursor);
+        self.clamp_queue_cursor();
+        if let Some(item) = removed {
+            self.status = format!(
+                "removed queued prompt: {}",
+                summarize_text(&item.prompt, 80)
+            );
+        } else {
+            self.status = "failed to remove queued prompt".to_string();
+        }
+        self.request_redraw(true);
+    }
+
+    fn set_executor_mode(&mut self, mode: Option<String>) {
+        self.executor_mode = normalize_executor_mode(mode.as_deref());
+        self.status = format!(
+            "mode set to {}",
+            mode_display(self.executor_mode.as_deref())
+        );
+        self.request_redraw(true);
+    }
+
+    fn handle_slash_command(&mut self, raw: &str) -> bool {
+        let trimmed = raw.trim();
+        if !trimmed.starts_with('/') {
+            return false;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let command = parts.next().unwrap_or_default().to_ascii_lowercase();
+        match command.as_str() {
+            "/help" => {
+                self.status = "commands: /mode [execute|plan|approvals|<custom>]  /plan  /execute  /model [name|index]  | Queue pane: Del/Backspace removes selected".to_string();
+                self.request_redraw(true);
+                true
+            }
+            "/plan" => self.try_update_mode("plan"),
+            "/execute" => self.try_update_mode("execute"),
+            "/mode" => {
+                if let Some(value) = parts.next() {
+                    self.try_update_mode(value)
+                } else {
+                    self.status = format!(
+                        "current mode: {}",
+                        mode_display(self.executor_mode.as_deref())
+                    );
+                    self.request_redraw(true);
+                    true
+                }
+            }
+            "/model" => {
+                if let Some(value) = parts.next() {
+                    self.try_update_model(value)
+                } else {
+                    let model = self.selected_model().unwrap_or_else(|| "n/a".to_string());
+                    self.status = format!("current model: {model}");
+                    self.request_redraw(true);
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn try_update_mode(&mut self, requested: &str) -> bool {
+        let normalized = normalize_executor_mode(Some(requested));
+        let Some(executor) = self.executor.as_ref() else {
+            self.status = "mode changes are unavailable before executor starts".to_string();
+            self.request_redraw(true);
+            return true;
+        };
+        let requested_label = normalized.as_deref().unwrap_or("execute");
+        if !executor_supports_mode(executor, requested_label) {
+            self.status = format!(
+                "mode '{requested_label}' is not supported for {:?}",
+                executor
+            );
+            self.request_redraw(true);
+            return true;
+        }
+        match requested_label {
+            "execute" | "default" => self.set_executor_mode(None),
+            _ => self.set_executor_mode(Some(requested_label.to_string())),
+        }
+        true
+    }
+
+    fn try_update_model(&mut self, requested: &str) -> bool {
+        if !self.model_config.has_options() {
+            self.status = "model selection is unavailable for this executor".to_string();
+            self.request_redraw(true);
+            return true;
+        }
+
+        if let Ok(ordinal) = requested.parse::<usize>()
+            && self.model_config.select_by_ordinal(ordinal)
+        {
+            self.status = format!(
+                "model set to {}",
+                self.model_config
+                    .selected_label()
+                    .unwrap_or_else(|| "n/a".to_string())
+            );
+            self.request_redraw(true);
+            return true;
+        }
+        if self.model_config.select_by_label(requested) {
+            self.status = format!(
+                "model set to {}",
+                self.model_config
+                    .selected_label()
+                    .unwrap_or_else(|| "n/a".to_string())
+            );
+        } else {
+            self.status = format!("model '{requested}' not found in choices");
+        }
+        self.request_redraw(true);
+        true
+    }
 }
 
 fn diff_line_style(line: &str) -> Style {
@@ -1059,7 +1264,14 @@ impl Default for TuiLogSink {
 impl LogSink for TuiLogSink {
     fn on_start(&mut self, options: &RunOptions) {
         self.started_at = Instant::now();
-        self.title = format!("AURA Executor: {:?}", options.executor);
+        self.executor = Some(options.executor.clone());
+        self.executor_mode = normalize_executor_mode(options.executor_mode.as_deref());
+        self.title = format!(
+            "{:?} @ {}",
+            options.executor,
+            summarize_text(&options.cwd.display().to_string(), 40)
+        );
+        self.task_summary = summarize_text(&options.prompt, 88);
         self.status = match &options.session_id {
             Some(session_id) => format!("starting (session {session_id})"),
             None => "starting".to_string(),
@@ -1117,25 +1329,58 @@ impl LogSink for TuiLogSink {
         }
     }
 
-    fn on_key_event(&mut self, key: KeyEvent) {
+    fn on_key_event(&mut self, key: KeyEvent) -> SinkKeyAction {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            return;
+            return SinkKeyAction::None;
         }
         if matches!(key.code, KeyCode::Tab) {
             self.toggle_pane();
-            return;
+            return SinkKeyAction::None;
         }
         match self.active_pane {
             TuiPane::Logs => {
+                if is_prompt_quit_key(key) {
+                    return SinkKeyAction::RequestQuit;
+                }
                 let _ = handle_logs_navigation_key(self, key);
+                SinkKeyAction::None
             }
-            TuiPane::Model => match key.code {
-                KeyCode::Left | KeyCode::Up => self.cycle_model_prev(),
-                KeyCode::Right | KeyCode::Down => self.cycle_model_next(),
-                _ => {}
+            TuiPane::Queue => match key.code {
+                KeyCode::Up => {
+                    self.queue_select_prev();
+                    SinkKeyAction::None
+                }
+                KeyCode::Down => {
+                    self.queue_select_next();
+                    SinkKeyAction::None
+                }
+                KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('x') | KeyCode::Char('X') => {
+                    self.remove_selected_queued_prompt();
+                    SinkKeyAction::None
+                }
+                _ => SinkKeyAction::None,
             },
-            TuiPane::Prompt => {}
+            TuiPane::Model => match key.code {
+                KeyCode::Left | KeyCode::Up => {
+                    self.cycle_model_prev();
+                    SinkKeyAction::None
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    self.cycle_model_next();
+                    SinkKeyAction::None
+                }
+                _ => self.handle_prompt_edit_key(key),
+            },
+            TuiPane::Prompt => self.handle_prompt_edit_key(key),
         }
+    }
+
+    fn on_paste(&mut self, text: &str) {
+        if matches!(self.active_pane, TuiPane::Logs | TuiPane::Queue) {
+            return;
+        }
+        self.input_text.push_str(text);
+        self.request_redraw(true);
     }
 }
 
@@ -1261,6 +1506,8 @@ struct RunCliArgs {
     append_prompt: Option<String>,
     #[arg(long = "model")]
     model: Option<String>,
+    #[arg(long = "mode")]
+    mode: Option<String>,
     #[arg(long = "openai-endpoint")]
     openai_endpoint: Option<String>,
     #[arg(long)]
@@ -1465,6 +1712,7 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
         additional_params: args.additional_params,
         append_prompt: args.append_prompt,
         model: args.model,
+        executor_mode: normalize_executor_mode(args.mode.as_deref()),
         openai_endpoint,
         local_provider,
         yolo: args.yolo,
@@ -2280,13 +2528,13 @@ fn session_cwd_matches(entry_cwd: &str, filter_cwd: &Path) -> bool {
     entry_canon == filter_canon || entry_cwd == filter_cwd.display().to_string()
 }
 
-pub fn list_sessions(args: SessionListArgs) -> String {
+fn filtered_session_entries(args: &SessionListArgs) -> Vec<SessionMetadata> {
     let mut entries = read_session_entries_from_index_or_disk();
     if let Some(executor) = args.executor {
         let executor_kind = executor_kind_from_arg(executor);
         entries.retain(|entry| entry.executor == executor_kind);
     }
-    if let Some(cwd) = args.cwd {
+    if let Some(cwd) = args.cwd.as_ref() {
         entries.retain(|entry| session_cwd_matches(&entry.cwd, &cwd));
     }
 
@@ -2294,7 +2542,10 @@ pub fn list_sessions(args: SessionListArgs) -> String {
     if let Some(limit) = args.limit {
         entries.truncate(limit);
     }
+    entries
+}
 
+fn format_session_list(entries: &[SessionMetadata]) -> String {
     if entries.is_empty() {
         return "no saved sessions found".to_string();
     }
@@ -2309,6 +2560,61 @@ pub fn list_sessions(args: SessionListArgs) -> String {
         ));
     }
     lines.join("\n")
+}
+
+pub fn list_sessions(args: SessionListArgs) -> String {
+    let entries = filtered_session_entries(&args);
+    format_session_list(&entries)
+}
+
+fn prompt_for_session_selection(entries: &[SessionMetadata]) -> Result<SessionMetadata, CliError> {
+    let mut selector = cliclack::select("Select session to resume");
+    for (index, entry) in entries.iter().enumerate() {
+        let label = format!(
+            "{} | {:?} | {} | {}",
+            entry.session_id, entry.executor, entry.created_at, entry.cwd
+        );
+        let thread = entry.thread_id.as_deref().unwrap_or("no thread");
+        let hint = if index == 0 {
+            format!("latest • thread: {thread}")
+        } else {
+            format!("thread: {thread}")
+        };
+        selector = selector.item(entry.session_id.clone(), label, hint);
+    }
+
+    let selected_session_id = selector
+        .interact()
+        .map_err(|error| CliError::Runtime(format!("session selection failed: {error}")))?;
+    entries
+        .iter()
+        .find(|entry| entry.session_id == selected_session_id)
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Runtime(format!("selected session not found: {selected_session_id}"))
+        })
+}
+
+pub async fn run_session_list(args: SessionListArgs) -> Result<Option<RunOutcome>, CliError> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(None);
+    }
+
+    let entries = filtered_session_entries(&args);
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let selected = prompt_for_session_selection(&entries)?;
+    let options = RunOptions {
+        executor: selected.executor,
+        prompt: "Continue from this session.".to_string(),
+        cwd: PathBuf::from(selected.cwd),
+        session_id: Some(selected.session_id),
+        resume: true,
+        ..RunOptions::default()
+    };
+    run_with_default_sink(options).await.map(Some)
 }
 
 pub fn latest_session() -> Result<String, CliError> {
@@ -2383,6 +2689,7 @@ enum TuiPromptAction {
     Submit {
         prompt: String,
         model: Option<String>,
+        mode: Option<String>,
     },
     Quit,
 }
@@ -2398,7 +2705,11 @@ async fn run_tui_session(
     sink: &mut TuiLogSink,
 ) -> Result<RunOutcome, CliError> {
     loop {
-        sink.set_input_text(String::new());
+        if let Some(submission) = sink.take_queued_prompt() {
+            options.prompt = submission.prompt;
+            options.model = submission.model;
+            options.executor_mode = submission.mode;
+        }
         sink.on_user_prompt(&options.prompt);
         let mut outcome = run_executor_inner(options.clone(), sink, true).await?;
 
@@ -2406,12 +2717,24 @@ async fn run_tui_session(
             return Ok(outcome);
         }
 
+        if let Some(submission) = sink.take_queued_prompt() {
+            options.prompt = submission.prompt;
+            options.model = submission.model;
+            options.executor_mode = submission.mode;
+            continue;
+        }
+
         sink.set_active_pane(TuiPane::Prompt);
-        sink.on_status("awaiting prompt (Tab=switch, Enter=send, Esc/Ctrl+C=quit)");
+        sink.on_status("awaiting prompt (Tab=switch, Enter=send, /mode plan, Esc/Ctrl+C=quit)");
         match read_tui_prompt_action(sink)? {
-            TuiPromptAction::Submit { prompt, model } => {
+            TuiPromptAction::Submit {
+                prompt,
+                model,
+                mode,
+            } => {
                 options.prompt = prompt;
                 options.model = model;
+                options.executor_mode = mode;
             }
             TuiPromptAction::Quit => {
                 outcome.user_requested_exit = true;
@@ -2593,6 +2916,7 @@ async fn run_executor_inner(
 }
 
 fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> {
+    let normalized_mode = normalize_executor_mode(options.executor_mode.as_deref());
     let executor_override = executor_path_override(&options.executor, &options.executor_paths);
     let cmd_overrides = CmdOverrides {
         base_command_override: options.base_command_override.clone().or(executor_override),
@@ -2607,20 +2931,35 @@ fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> 
     let append_prompt = AppendPrompt(options.append_prompt.clone());
 
     match options.executor {
-        ExecutorKind::Codex => Box::new(adapters::codex(CodexOptions {
+        ExecutorKind::Codex => {
+            let (sandbox, ask_for_approval) = codex_mode_settings(normalized_mode.as_deref());
+            Box::new(adapters::codex(CodexOptions {
+                append_prompt,
+                model: options.model.clone(),
+                sandbox,
+                ask_for_approval,
+                cmd_overrides,
+            }))
+        }
+        ExecutorKind::Claude => {
+            let (plan, approvals, dangerously_skip_permissions) =
+                claude_mode_settings(normalized_mode.as_deref());
+            Box::new(adapters::claude(ClaudeOptions {
+                append_prompt,
+                model: options.model.clone(),
+                plan,
+                approvals,
+                dangerously_skip_permissions,
+                claude_code_router: false,
+                cmd_overrides,
+            }))
+        }
+        ExecutorKind::Opencode => Box::new(adapters::opencode(OpencodeOptions {
             append_prompt,
             model: options.model.clone(),
-            sandbox: None,
-            ask_for_approval: None,
-            cmd_overrides,
-        })),
-        ExecutorKind::Claude => Box::new(adapters::claude(ClaudeOptions {
-            append_prompt,
-            model: options.model.clone(),
-            plan: false,
-            approvals: false,
-            dangerously_skip_permissions: false,
-            claude_code_router: false,
+            variant: None,
+            mode: opencode_agent_mode(normalized_mode.as_deref()),
+            auto_approve: options.auto_approve,
             cmd_overrides,
         })),
         ExecutorKind::CursorAgent => Box::new(adapters::cursor_agent(CursorAgentOptions {
@@ -2646,14 +2985,6 @@ fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> 
             append_prompt,
             model: options.model.clone(),
             yolo: options.yolo,
-            cmd_overrides,
-        })),
-        ExecutorKind::Opencode => Box::new(adapters::opencode(OpencodeOptions {
-            append_prompt,
-            model: options.model.clone(),
-            variant: None,
-            mode: None,
-            auto_approve: options.auto_approve,
             cmd_overrides,
         })),
         ExecutorKind::Local => {
@@ -2716,6 +3047,36 @@ fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> 
             },
             vec![aura_executors::ExecutorCapability::SessionFork],
         )),
+    }
+}
+
+fn codex_mode_settings(mode: Option<&str>) -> (Option<String>, Option<String>) {
+    match mode {
+        Some("plan") => (
+            Some("read-only".to_string()),
+            Some("on-request".to_string()),
+        ),
+        Some("yolo") => (
+            Some("workspace-write".to_string()),
+            Some("never".to_string()),
+        ),
+        _ => (None, None),
+    }
+}
+
+fn claude_mode_settings(mode: Option<&str>) -> (bool, bool, bool) {
+    match mode {
+        Some("plan") => (true, false, false),
+        Some("approvals") | Some("approval") => (false, true, false),
+        Some("yolo") => (false, false, true),
+        _ => (false, false, false),
+    }
+}
+
+fn opencode_agent_mode(mode: Option<&str>) -> Option<String> {
+    match mode {
+        Some("execute") | Some("default") | None => None,
+        Some(other) => Some(other.to_string()),
     }
 }
 
@@ -3075,9 +3436,20 @@ pub(crate) async fn stream_spawned(
 
     loop {
         if enable_keyboard_controls {
-            if let Ok(Some(key)) = read_keyboard_event() {
-                sink.on_key_event(key);
-                if is_quit_key(key) {
+            if let Ok(Some(terminal_event)) = read_terminal_event() {
+                let requested_quit = match terminal_event {
+                    Event::Key(key) => {
+                        let key_action = sink.on_key_event(key);
+                        matches!(key_action, SinkKeyAction::RequestQuit) || is_quit_key(key)
+                    }
+                    Event::Paste(text) => {
+                        sink.on_paste(&text);
+                        false
+                    }
+                    _ => false,
+                };
+
+                if requested_quit {
                     if quit_requested_at.is_none() {
                         user_requested_exit = true;
                         sink.on_status("stopping subprocess (user requested exit)");
@@ -3196,14 +3568,11 @@ pub(crate) async fn stream_spawned(
     })
 }
 
-fn read_keyboard_event() -> io::Result<Option<KeyEvent>> {
+fn read_terminal_event() -> io::Result<Option<Event>> {
     if !event::poll(Duration::from_millis(0))? {
         return Ok(None);
     }
-    let Event::Key(key) = event::read()? else {
-        return Ok(None);
-    };
-    Ok(Some(key))
+    Ok(Some(event::read()?))
 }
 
 fn is_quit_key(key: KeyEvent) -> bool {
@@ -3213,7 +3582,6 @@ fn is_quit_key(key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Esc => true,
-        KeyCode::Char('q') | KeyCode::Char('Q') => true,
         KeyCode::Char('c') | KeyCode::Char('C') => key.modifiers.contains(KeyModifiers::CONTROL),
         _ => false,
     }
@@ -3273,79 +3641,26 @@ fn is_prompt_quit_key(key: KeyEvent) -> bool {
 }
 
 fn read_tui_prompt_action(sink: &mut TuiLogSink) -> io::Result<TuiPromptAction> {
-    let mut input = String::new();
-    sink.set_input_text(String::new());
-
     loop {
+        if let Some(submission) = sink.take_queued_prompt() {
+            return Ok(TuiPromptAction::Submit {
+                prompt: submission.prompt,
+                model: submission.model,
+                mode: submission.mode,
+            });
+        }
+
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
 
         match event::read()? {
             Event::Key(key) => {
-                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    continue;
-                }
-                if matches!(key.code, KeyCode::Tab) {
-                    sink.toggle_pane();
-                    continue;
-                }
-
-                if sink.active_pane() == TuiPane::Logs {
-                    if is_prompt_quit_key(key) {
-                        sink.set_input_text(String::new());
-                        return Ok(TuiPromptAction::Quit);
-                    }
-                    if handle_logs_navigation_key(sink, key) {
-                        continue;
-                    }
-                    continue;
-                }
-
-                if sink.active_pane() == TuiPane::Model {
-                    if is_prompt_quit_key(key) {
-                        sink.set_input_text(String::new());
-                        return Ok(TuiPromptAction::Quit);
-                    }
-                    match key.code {
-                        KeyCode::Left | KeyCode::Up => sink.cycle_model_prev(),
-                        KeyCode::Right | KeyCode::Down => sink.cycle_model_next(),
-                        KeyCode::Enter => {
-                            let prompt = input.trim();
-                            if !prompt.is_empty() {
-                                sink.set_input_text(String::new());
-                                return Ok(TuiPromptAction::Submit {
-                                    prompt: prompt.to_string(),
-                                    model: sink.selected_model(),
-                                });
-                            }
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                match apply_prompt_input_key(&mut input, key) {
-                    PromptInputUpdate::Continue => sink.set_input_text(input.clone()),
-                    PromptInputUpdate::Submit(prompt) => {
-                        sink.set_input_text(String::new());
-                        return Ok(TuiPromptAction::Submit {
-                            prompt,
-                            model: sink.selected_model(),
-                        });
-                    }
-                    PromptInputUpdate::Quit => {
-                        sink.set_input_text(String::new());
-                        return Ok(TuiPromptAction::Quit);
-                    }
+                if matches!(sink.on_key_event(key), SinkKeyAction::RequestQuit) {
+                    return Ok(TuiPromptAction::Quit);
                 }
             }
-            Event::Paste(pasted) => {
-                if sink.active_pane() == TuiPane::Prompt {
-                    input.push_str(&pasted);
-                    sink.set_input_text(input.clone());
-                }
-            }
+            Event::Paste(pasted) => sink.on_paste(&pasted),
             _ => {}
         }
     }
@@ -3444,6 +3759,28 @@ mod tests {
                 assert_eq!(opts.prompt, "hello");
                 assert!(opts.yolo);
                 assert!(!opts.tui);
+            }
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn parses_run_command_with_mode() {
+        let args = vec![
+            "run".to_string(),
+            "--executor".to_string(),
+            "claude".to_string(),
+            "--prompt".to_string(),
+            "hello".to_string(),
+            "--mode".to_string(),
+            "plan".to_string(),
+        ];
+
+        let parsed = parse_cli_args(&args).expect("parse");
+        match parsed {
+            CliCommand::Run(opts) => {
+                assert!(matches!(opts.executor, ExecutorKind::Claude));
+                assert_eq!(opts.executor_mode.as_deref(), Some("plan"));
             }
             _ => panic!("expected run"),
         }
@@ -3690,19 +4027,9 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
 
     #[test]
     fn quit_key_mapping() {
-        assert!(is_quit_key(KeyEvent::new(
+        assert!(!is_quit_key(KeyEvent::new(
             KeyCode::Char('q'),
             KeyModifiers::NONE
-        )));
-        assert!(is_quit_key(KeyEvent::new_with_kind(
-            KeyCode::Char('q'),
-            KeyModifiers::NONE,
-            crossterm::event::KeyEventKind::Repeat
-        )));
-        assert!(!is_quit_key(KeyEvent::new_with_kind(
-            KeyCode::Char('q'),
-            KeyModifiers::NONE,
-            crossterm::event::KeyEventKind::Release
         )));
         assert!(is_quit_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(is_quit_key(KeyEvent::new(
@@ -3798,6 +4125,20 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             event,
             DisplayEvent::AgentMarkdown(text) if text.contains("Here is data:")
         )));
+    }
+
+    #[test]
+    fn mode_mappings_apply_expected_executor_settings() {
+        assert_eq!(
+            codex_mode_settings(Some("plan")),
+            (
+                Some("read-only".to_string()),
+                Some("on-request".to_string())
+            )
+        );
+        assert_eq!(claude_mode_settings(Some("plan")), (true, false, false));
+        assert_eq!(opencode_agent_mode(Some("execute")), None);
+        assert_eq!(opencode_agent_mode(Some("plan")), Some("plan".to_string()));
     }
 
     #[test]
@@ -3905,6 +4246,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             ],
             append_prompt: None,
             model: None,
+            executor_mode: None,
             openai_endpoint: None,
             local_provider: None,
             yolo: false,
@@ -3942,6 +4284,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             ],
             append_prompt: None,
             model: None,
+            executor_mode: None,
             openai_endpoint: None,
             local_provider: None,
             yolo: false,
@@ -3974,6 +4317,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             additional_params: Vec::new(),
             append_prompt: None,
             model: None,
+            executor_mode: None,
             openai_endpoint: None,
             local_provider: None,
             yolo: true,
