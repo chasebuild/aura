@@ -76,3 +76,61 @@ fn run_custom_executor_propagates_failure_exit_code() {
         "stdout was: {stdout}"
     );
 }
+
+#[test]
+fn orchestrator_submit_and_tick_commands_work() {
+    let home = tempfile::tempdir().expect("tmp home");
+
+    let submit_output = Command::new(aura_bin())
+        .args([
+            "orchestrator",
+            "submit",
+            "--title",
+            "Ship feature",
+            "--intent",
+            "Fix backend bug",
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("submit");
+    assert!(
+        submit_output.status.success(),
+        "submit status {:?}",
+        submit_output.status.code()
+    );
+
+    let tick_output = Command::new(aura_bin())
+        .args(["orchestrator", "tick"])
+        .env("HOME", home.path())
+        .output()
+        .expect("tick");
+    assert!(
+        tick_output.status.success(),
+        "tick status {:?}",
+        tick_output.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&tick_output.stdout);
+    assert!(stdout.contains("\"processed\""), "stdout was: {stdout}");
+}
+
+#[test]
+fn orchestrator_retry_missing_task_returns_error() {
+    let home = tempfile::tempdir().expect("tmp home");
+    let output = Command::new(aura_bin())
+        .args([
+            "orchestrator",
+            "retry",
+            "--task-id",
+            "11111111-1111-1111-1111-111111111111",
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("retry");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("orch_task"),
+        "stderr did not include not found marker: {stderr}"
+    );
+}

@@ -43,9 +43,20 @@ Usage:
   aura session list
   aura session show <session_id>
   aura session latest
+  aura orchestrator daemon
+  aura orchestrator tick
+  aura orchestrator submit --title <text> --intent <text> [options]
+  aura orchestrator status
+  aura orchestrator retry --task-id <id>
   aura completion <shell>
   aura help
 ```
+
+Orchestrator notes:
+
+- Config merge order: `~/.aura/orchestrator.toml` then `.aura/orchestrator.toml`.
+- Default persistence: SQLite at `~/.aura/orchestrator.db`.
+- `tick` enforces lock-based single-run safety using `~/.aura/orchestrator.tick.lock`.
 
 Executors:
 
@@ -99,6 +110,8 @@ Shell completion scripts can be generated with `aura completion bash|zsh|fish|po
 - `aura-executors`: Executor abstraction and adapter implementations.
 - `aura-worker-protocol`: JSON-RPC protocol/messages for remote worker daemons.
 - `aura-engine`: Deterministic state machine, prompts, and orchestration runtime.
+- `aura-notify-contracts`: Notification contracts/events for pluggable external notifier projects.
+- `aura-orchestrator`: Multi-agent supervisor loop (`submit`/`tick`/`daemon`) with strict done-gate + retry policy.
 - `aura-cli`: TUI/CLI runner for launching executors and streaming logs.
 
 ## Engine Model

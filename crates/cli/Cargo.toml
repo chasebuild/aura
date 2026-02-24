@@ -21,6 +21,7 @@ path = "src/main.rs"
 aura-contracts.workspace = true
 aura-executors.workspace = true
 aura-usage.workspace = true
+aura-orchestrator.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 cliclack = "0.3"
@@ -36,3 +37,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+tempfile = "3"

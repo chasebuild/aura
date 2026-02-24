@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aura_contracts::{ExecutorKind, SessionId};
+use aura_contracts::{ExecutorKind, OrchTaskId, OrchestratorTaskPriority, SessionId};
 use aura_executors::adapters::{
     AmpOptions, ClaudeOptions, CodexOptions, CopilotOptions, CursorAgentOptions, DroidOptions,
     GeminiOptions, LocalOptions, OllamaOptions, OpencodeOptions, QwenCodeOptions,
@@ -13,6 +13,7 @@ use aura_executors::{
     AppendPrompt, CmdOverrides, ExecutionEnv, ExecutorError, ExecutorProfileId, RepoContext,
     SpawnedChild, StandardCodingAgentExecutor, adapters,
 };
+use aura_orchestrator::{SubmitRequest, build_default_supervisor};
 use aura_usage::UsageTracker;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
@@ -1391,9 +1392,28 @@ pub enum CliCommand {
     SessionList(SessionListArgs),
     SessionShow { session_id: String },
     SessionLatest,
+    Orchestrator(OrchestratorCliCommand),
     Help,
     Completion { shell: Shell },
     LocalExec,
+}
+
+#[derive(Debug, Clone)]
+pub enum OrchestratorCliCommand {
+    Daemon,
+    Tick,
+    Submit {
+        title: String,
+        intent: String,
+        priority: OrchestratorTaskPriority,
+        planner_enabled: bool,
+        context_json: serde_json::Value,
+        dependencies: Vec<OrchTaskId>,
+    },
+    Status,
+    Retry {
+        task_id: OrchTaskId,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -1413,10 +1433,56 @@ enum AuraSubcommand {
     Run(RunCliArgs),
     Tui(RunCliArgs),
     Session(SessionCommand),
+    Orchestrator(OrchestratorCommand),
     Help,
     Completion(CompletionArgs),
     #[command(name = "local-exec", hide = true)]
     LocalExec,
+}
+
+#[derive(Debug, Args)]
+struct OrchestratorCommand {
+    #[command(subcommand)]
+    command: OrchestratorArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum OrchestratorArgs {
+    Daemon,
+    Tick,
+    Submit(OrchestratorSubmitArgs),
+    Status,
+    Retry(OrchestratorRetryArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OrchestratorPriorityArg {
+    Low,
+    Normal,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Args)]
+struct OrchestratorSubmitArgs {
+    #[arg(long)]
+    title: String,
+    #[arg(long)]
+    intent: String,
+    #[arg(long, value_enum, default_value_t = OrchestratorPriorityArg::Normal)]
+    priority: OrchestratorPriorityArg,
+    #[arg(long = "planner")]
+    planner_enabled: bool,
+    #[arg(long = "context-json")]
+    context_json: Option<String>,
+    #[arg(long = "depends-on")]
+    depends_on: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct OrchestratorRetryArgs {
+    #[arg(long = "task-id")]
+    task_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -1541,6 +1607,53 @@ fn local_provider_from_executor_arg(value: ExecutorArg) -> Option<LocalProvider>
         ExecutorArg::Custom => Some(LocalProvider::Custom),
         _ => None,
     }
+}
+
+fn orchestrator_priority_from_arg(value: OrchestratorPriorityArg) -> OrchestratorTaskPriority {
+    match value {
+        OrchestratorPriorityArg::Low => OrchestratorTaskPriority::Low,
+        OrchestratorPriorityArg::Normal => OrchestratorTaskPriority::Normal,
+        OrchestratorPriorityArg::High => OrchestratorTaskPriority::High,
+        OrchestratorPriorityArg::Critical => OrchestratorTaskPriority::Critical,
+    }
+}
+
+fn parse_orch_task_id(raw: &str) -> Result<OrchTaskId, CliError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(CliError::Arg(
+            "orchestrator task id must not be empty".to_string(),
+        ));
+    }
+
+    serde_json::from_value(Value::String(value.to_string()))
+        .map_err(|error| CliError::Arg(format!("invalid orchestrator task id '{value}': {error}")))
+}
+
+fn parse_orchestrator_submit(
+    args: OrchestratorSubmitArgs,
+) -> Result<OrchestratorCliCommand, CliError> {
+    let context_json = if let Some(raw) = args.context_json {
+        serde_json::from_str::<Value>(&raw)
+            .map_err(|error| CliError::Arg(format!("invalid --context-json payload: {error}")))?
+    } else {
+        json!({})
+    };
+
+    let dependencies = args
+        .depends_on
+        .iter()
+        .map(|raw| parse_orch_task_id(raw))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(OrchestratorCliCommand::Submit {
+        title: args.title,
+        intent: args.intent,
+        priority: orchestrator_priority_from_arg(args.priority),
+        planner_enabled: args.planner_enabled,
+        context_json,
+        dependencies,
+    })
 }
 
 fn normalize_executor_key(value: &str) -> Option<String> {
@@ -1750,9 +1863,87 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, CliError> {
             }),
             SessionArgs::Latest => Ok(CliCommand::SessionLatest),
         },
+        AuraSubcommand::Orchestrator(orch) => {
+            let cmd = match orch.command {
+                OrchestratorArgs::Daemon => OrchestratorCliCommand::Daemon,
+                OrchestratorArgs::Tick => OrchestratorCliCommand::Tick,
+                OrchestratorArgs::Status => OrchestratorCliCommand::Status,
+                OrchestratorArgs::Submit(args) => parse_orchestrator_submit(args)?,
+                OrchestratorArgs::Retry(args) => OrchestratorCliCommand::Retry {
+                    task_id: parse_orch_task_id(&args.task_id)?,
+                },
+            };
+            Ok(CliCommand::Orchestrator(cmd))
+        }
         AuraSubcommand::Help => Ok(CliCommand::Help),
         AuraSubcommand::Completion(args) => Ok(CliCommand::Completion { shell: args.shell }),
         AuraSubcommand::LocalExec => Ok(CliCommand::LocalExec),
+    }
+}
+
+pub async fn run_orchestrator_command(
+    command: OrchestratorCliCommand,
+    cwd: PathBuf,
+) -> Result<(), CliError> {
+    let supervisor = build_default_supervisor(&cwd)
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+
+    match command {
+        OrchestratorCliCommand::Daemon => supervisor
+            .daemon()
+            .await
+            .map_err(|error| CliError::Runtime(error.to_string())),
+        OrchestratorCliCommand::Tick => {
+            let summary = supervisor
+                .tick()
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .map_err(|error| CliError::Runtime(error.to_string()))?
+            );
+            Ok(())
+        }
+        OrchestratorCliCommand::Submit {
+            title,
+            intent,
+            priority,
+            planner_enabled,
+            context_json,
+            dependencies,
+        } => {
+            let task_id = supervisor
+                .submit(SubmitRequest {
+                    title,
+                    intent,
+                    priority,
+                    planner_enabled,
+                    context_json,
+                    dependencies,
+                })
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            println!("{}", task_id.0);
+            Ok(())
+        }
+        OrchestratorCliCommand::Status => {
+            let status = supervisor
+                .status_json()
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&status)
+                    .map_err(|error| CliError::Runtime(error.to_string()))?
+            );
+            Ok(())
+        }
+        OrchestratorCliCommand::Retry { task_id } => supervisor
+            .retry_task(task_id)
+            .await
+            .map_err(|error| CliError::Runtime(error.to_string())),
     }
 }
 
@@ -2461,6 +2652,65 @@ mod tests {
                 assert!(opts.tui);
             }
             _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_submit_command() {
+        let args = vec![
+            "orchestrator".to_string(),
+            "submit".to_string(),
+            "--title".to_string(),
+            "Ship feature".to_string(),
+            "--intent".to_string(),
+            "Fix backend bug".to_string(),
+            "--priority".to_string(),
+            "high".to_string(),
+            "--planner".to_string(),
+            "--context-json".to_string(),
+            "{\"ui_changed\":true}".to_string(),
+        ];
+
+        let parsed = parse_cli_args(&args).expect("parse");
+        match parsed {
+            CliCommand::Orchestrator(OrchestratorCliCommand::Submit {
+                title,
+                intent,
+                priority,
+                planner_enabled,
+                context_json,
+                dependencies,
+            }) => {
+                assert_eq!(title, "Ship feature");
+                assert_eq!(intent, "Fix backend bug");
+                assert_eq!(priority, OrchestratorTaskPriority::High);
+                assert!(planner_enabled);
+                assert_eq!(
+                    context_json.get("ui_changed").and_then(Value::as_bool),
+                    Some(true)
+                );
+                assert!(dependencies.is_empty());
+            }
+            _ => panic!("expected orchestrator submit"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_retry_command() {
+        let task_id = OrchTaskId::new();
+        let args = vec![
+            "orchestrator".to_string(),
+            "retry".to_string(),
+            "--task-id".to_string(),
+            task_id.0.to_string(),
+        ];
+
+        let parsed = parse_cli_args(&args).expect("parse");
+        match parsed {
+            CliCommand::Orchestrator(OrchestratorCliCommand::Retry { task_id: parsed }) => {
+                assert_eq!(parsed, task_id);
+            }
+            _ => panic!("expected orchestrator retry"),
         }
     }
 

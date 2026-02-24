@@ -2,14 +2,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_contracts::{ExecutionStatus, ProcessId, SessionId, WorkspaceId};
+use aura_contracts::{
+    ExecutionStatus, OrchAttemptId, OrchTaskId, OrchestratorTaskStatus, ProcessId, SessionId,
+    WorkspaceId,
+};
 use chrono::Utc;
 use tokio::sync::RwLock;
 
 use crate::{
-    AuraStore, BoardRulesRecord, BoardRulesStore, ExecutionRecord, ExecutionStore, PromptScope,
-    PromptTemplateRecord, PromptTemplateStore, SessionRecord, SessionStore, StoreError,
-    StoreResult, StoreTx, TaskRecord, TaskStore, WorkspaceRecord, WorkspaceStore,
+    AuraStore, BoardRulesRecord, BoardRulesStore, ExecutionRecord, ExecutionStore,
+    OrchAttemptRecord, OrchEventRecord, OrchGateRecord, OrchTaskDependencyRecord, OrchTaskRecord,
+    OrchestratorStore, PromptScope, PromptTemplateRecord, PromptTemplateStore, SessionRecord,
+    SessionStore, StoreError, StoreResult, StoreTx, TaskRecord, TaskStore, WorkspaceRecord,
+    WorkspaceStore,
 };
 
 #[derive(Default)]
@@ -20,6 +25,11 @@ struct MemoryState {
     executions: HashMap<aura_contracts::ProcessId, ExecutionRecord>,
     board_rules: Option<BoardRulesRecord>,
     templates: HashMap<(PromptScope, aura_contracts::ExecutionStage), PromptTemplateRecord>,
+    orch_tasks: HashMap<OrchTaskId, OrchTaskRecord>,
+    orch_task_dependencies: HashMap<OrchTaskId, Vec<OrchTaskDependencyRecord>>,
+    orch_attempts: HashMap<OrchAttemptId, OrchAttemptRecord>,
+    orch_gates: HashMap<OrchAttemptId, Vec<OrchGateRecord>>,
+    orch_events: Vec<OrchEventRecord>,
 }
 
 #[derive(Clone, Default)]
@@ -284,6 +294,170 @@ impl PromptTemplateStore for MemoryStore {
             .values()
             .cloned()
             .collect())
+    }
+}
+
+#[async_trait]
+impl OrchestratorStore for MemoryStore {
+    async fn upsert_orch_task(&self, task: OrchTaskRecord) -> StoreResult<()> {
+        self.inner.write().await.orch_tasks.insert(task.id, task);
+        Ok(())
+    }
+
+    async fn get_orch_task(&self, task_id: OrchTaskId) -> StoreResult<Option<OrchTaskRecord>> {
+        Ok(self.inner.read().await.orch_tasks.get(&task_id).cloned())
+    }
+
+    async fn list_orch_tasks(&self) -> StoreResult<Vec<OrchTaskRecord>> {
+        let mut tasks = self
+            .inner
+            .read()
+            .await
+            .orch_tasks
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|task| task.created_at);
+        Ok(tasks)
+    }
+
+    async fn set_orch_task_status(
+        &self,
+        task_id: OrchTaskId,
+        status: OrchestratorTaskStatus,
+    ) -> StoreResult<()> {
+        let mut inner = self.inner.write().await;
+        let task = inner
+            .orch_tasks
+            .get_mut(&task_id)
+            .ok_or(StoreError::NotFound("orch_task"))?;
+        task.status = status;
+        task.updated_at = Utc::now();
+        Ok(())
+    }
+
+    async fn replace_orch_task_dependencies(
+        &self,
+        task_id: OrchTaskId,
+        dependencies: Vec<OrchTaskDependencyRecord>,
+    ) -> StoreResult<()> {
+        self.inner
+            .write()
+            .await
+            .orch_task_dependencies
+            .insert(task_id, dependencies);
+        Ok(())
+    }
+
+    async fn list_orch_task_dependencies(
+        &self,
+        task_id: OrchTaskId,
+    ) -> StoreResult<Vec<OrchTaskDependencyRecord>> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .orch_task_dependencies
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn upsert_orch_attempt(&self, attempt: OrchAttemptRecord) -> StoreResult<()> {
+        self.inner
+            .write()
+            .await
+            .orch_attempts
+            .insert(attempt.id, attempt);
+        Ok(())
+    }
+
+    async fn get_orch_attempt(
+        &self,
+        attempt_id: OrchAttemptId,
+    ) -> StoreResult<Option<OrchAttemptRecord>> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .orch_attempts
+            .get(&attempt_id)
+            .cloned())
+    }
+
+    async fn list_orch_attempts_by_task(
+        &self,
+        task_id: OrchTaskId,
+    ) -> StoreResult<Vec<OrchAttemptRecord>> {
+        let mut attempts = self
+            .inner
+            .read()
+            .await
+            .orch_attempts
+            .values()
+            .filter(|attempt| attempt.task_id == task_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        attempts.sort_by_key(|attempt| attempt.started_at);
+        Ok(attempts)
+    }
+
+    async fn replace_orch_gates(
+        &self,
+        task_id: OrchTaskId,
+        attempt_id: OrchAttemptId,
+        gates: Vec<OrchGateRecord>,
+    ) -> StoreResult<()> {
+        if gates
+            .iter()
+            .any(|gate| gate.task_id != task_id || gate.attempt_id != attempt_id)
+        {
+            return Err(StoreError::Validation(
+                "gate task/attempt mismatch".to_string(),
+            ));
+        }
+        self.inner
+            .write()
+            .await
+            .orch_gates
+            .insert(attempt_id, gates);
+        Ok(())
+    }
+
+    async fn list_orch_gates_by_attempt(
+        &self,
+        attempt_id: OrchAttemptId,
+    ) -> StoreResult<Vec<OrchGateRecord>> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .orch_gates
+            .get(&attempt_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn append_orch_event(&self, event: OrchEventRecord) -> StoreResult<()> {
+        self.inner.write().await.orch_events.push(event);
+        Ok(())
+    }
+
+    async fn list_orch_events_by_task(
+        &self,
+        task_id: OrchTaskId,
+    ) -> StoreResult<Vec<OrchEventRecord>> {
+        let mut events = self
+            .inner
+            .read()
+            .await
+            .orch_events
+            .iter()
+            .filter(|event| event.task_id == task_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| event.created_at);
+        Ok(events)
     }
 }
 

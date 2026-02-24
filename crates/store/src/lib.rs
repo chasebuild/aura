@@ -6,8 +6,9 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use aura_contracts::{
-    BoardColumn, BoardColumnId, CanonicalTaskState, ExecutionStage, ExecutionStatus, ProcessId,
-    ProjectId, SessionId, TaskId, TransitionRule, WorkspaceId,
+    BoardColumn, BoardColumnId, CanonicalTaskState, ExecutionStage, ExecutionStatus, GateStatus,
+    OrchAttemptId, OrchTaskId, OrchestratorAttemptStatus, OrchestratorTaskPriority,
+    OrchestratorTaskStatus, ProcessId, ProjectId, SessionId, TaskId, TransitionRule, WorkspaceId,
 };
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
@@ -99,6 +100,57 @@ pub struct PromptTemplateRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchTaskRecord {
+    pub id: OrchTaskId,
+    pub title: String,
+    pub intent: String,
+    pub status: OrchestratorTaskStatus,
+    pub priority: OrchestratorTaskPriority,
+    pub planner_enabled: bool,
+    pub context_json: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchTaskDependencyRecord {
+    pub task_id: OrchTaskId,
+    pub depends_on_task_id: OrchTaskId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchAttemptRecord {
+    pub id: OrchAttemptId,
+    pub task_id: OrchTaskId,
+    pub process_id: Option<ProcessId>,
+    pub executor_profile: String,
+    pub prompt_snapshot: String,
+    pub status: OrchestratorAttemptStatus,
+    pub retry_index: i32,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchGateRecord {
+    pub task_id: OrchTaskId,
+    pub attempt_id: OrchAttemptId,
+    pub gate_name: String,
+    pub status: GateStatus,
+    pub details_json: serde_json::Value,
+    pub checked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchEventRecord {
+    pub task_id: OrchTaskId,
+    pub attempt_id: Option<OrchAttemptId>,
+    pub event_type: String,
+    pub payload_json: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
 #[async_trait]
 pub trait StoreTx: Send + Sync {
     async fn commit(self: Box<Self>) -> StoreResult<()>;
@@ -181,8 +233,63 @@ pub trait PromptTemplateStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait OrchestratorStore: Send + Sync {
+    async fn upsert_orch_task(&self, task: OrchTaskRecord) -> StoreResult<()>;
+    async fn get_orch_task(&self, task_id: OrchTaskId) -> StoreResult<Option<OrchTaskRecord>>;
+    async fn list_orch_tasks(&self) -> StoreResult<Vec<OrchTaskRecord>>;
+    async fn set_orch_task_status(
+        &self,
+        task_id: OrchTaskId,
+        status: OrchestratorTaskStatus,
+    ) -> StoreResult<()>;
+
+    async fn replace_orch_task_dependencies(
+        &self,
+        task_id: OrchTaskId,
+        dependencies: Vec<OrchTaskDependencyRecord>,
+    ) -> StoreResult<()>;
+    async fn list_orch_task_dependencies(
+        &self,
+        task_id: OrchTaskId,
+    ) -> StoreResult<Vec<OrchTaskDependencyRecord>>;
+
+    async fn upsert_orch_attempt(&self, attempt: OrchAttemptRecord) -> StoreResult<()>;
+    async fn get_orch_attempt(
+        &self,
+        attempt_id: OrchAttemptId,
+    ) -> StoreResult<Option<OrchAttemptRecord>>;
+    async fn list_orch_attempts_by_task(
+        &self,
+        task_id: OrchTaskId,
+    ) -> StoreResult<Vec<OrchAttemptRecord>>;
+
+    async fn replace_orch_gates(
+        &self,
+        task_id: OrchTaskId,
+        attempt_id: OrchAttemptId,
+        gates: Vec<OrchGateRecord>,
+    ) -> StoreResult<()>;
+    async fn list_orch_gates_by_attempt(
+        &self,
+        attempt_id: OrchAttemptId,
+    ) -> StoreResult<Vec<OrchGateRecord>>;
+
+    async fn append_orch_event(&self, event: OrchEventRecord) -> StoreResult<()>;
+    async fn list_orch_events_by_task(
+        &self,
+        task_id: OrchTaskId,
+    ) -> StoreResult<Vec<OrchEventRecord>>;
+}
+
+#[async_trait]
 pub trait AuraStore:
-    TaskStore + WorkspaceStore + SessionStore + ExecutionStore + BoardRulesStore + PromptTemplateStore
+    TaskStore
+    + WorkspaceStore
+    + SessionStore
+    + ExecutionStore
+    + BoardRulesStore
+    + PromptTemplateStore
+    + OrchestratorStore
 {
     async fn begin_tx(&self) -> StoreResult<Box<dyn StoreTx>>;
 }

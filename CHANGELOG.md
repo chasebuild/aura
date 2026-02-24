@@ -6,6 +6,26 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Added
+
+- Added `aura-orchestrator` crate with a composable supervisor runtime:
+  - `submit`, `tick`, `status`, `retry`, and `daemon` flows.
+  - Dependency-aware scheduler, optional planner validation, adaptive retry policy, and strict gate orchestration hooks.
+  - Provider interfaces for `TaskSource`, `ContextProvider`, `AgentRouter`, `GitHostProvider`, and retry strategy.
+- Added `aura-notify-contracts` crate with `NotificationEvent`, `NotificationMessage`, `NotificationSink`, and a no-op sink.
+- Added CLI orchestrator commands:
+  - `aura orchestrator daemon`
+  - `aura orchestrator tick`
+  - `aura orchestrator submit`
+  - `aura orchestrator status`
+  - `aura orchestrator retry`
+- Added orchestration domain contracts and store records:
+  - Orchestrator task/attempt IDs and statuses.
+  - Orchestrator task, dependency, attempt, gate, and event records.
+  - Orchestrator store trait APIs.
+- Added SQLite orchestrator persistence tables (`orch_tasks`, `orch_task_dependencies`, `orch_attempts`, `orch_gates`, `orch_events`) and in-memory parity support.
+- Added SQLite backend implementation in `aura-store` for all core store traits (tasks/workspaces/sessions/executions/board rules/prompt templates) plus orchestrator entities.
+
 ### Changed
 
 - Updated project documentation across `README.md`, `CONTRIBUTING.md`, and `CHANGELOG.md`.

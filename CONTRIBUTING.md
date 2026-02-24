@@ -87,6 +87,8 @@ npm run release:publish -- --dry-run
 - `/crates/executors`: executor adapters
 - `/crates/worker-protocol`: remote worker protocol
 - `/crates/engine`: orchestration engine
+- `/crates/notify-contracts`: notification sink contracts/events
+- `/crates/orchestrator`: multi-agent supervisor runtime
 - `/crates/cli`: `aura` command-line and TUI interface
 
 ## Pull Request Checklist

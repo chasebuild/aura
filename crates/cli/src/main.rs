@@ -1,6 +1,7 @@
 use aura_cli::{
     CliCommand, completion_script, latest_session, list_sessions, parse_cli_args,
-    run_local_exec_from_env, run_session_list, run_with_default_sink, show_session, usage,
+    run_local_exec_from_env, run_orchestrator_command, run_session_list, run_with_default_sink,
+    show_session, usage,
 };
 
 #[tokio::main]
@@ -53,6 +54,13 @@ async fn main() {
         },
         CliCommand::LocalExec => {
             std::process::exit(run_local_exec_from_env().await);
+        }
+        CliCommand::Orchestrator(command) => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            if let Err(err) = run_orchestrator_command(command, cwd).await {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
         }
         CliCommand::Run(options) => match run_with_default_sink(*options).await {
             Ok(outcome) => {
