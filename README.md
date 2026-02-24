@@ -40,6 +40,8 @@ cargo run -p aura-cli -- run --executor custom --prompt "ignored" --base-command
 Usage:
   aura run --executor <name> --prompt <text> [options]
   aura tui --executor <name> --prompt <text> [options]
+  aura session list
+  aura session show <session_id>
   aura completion <shell>
   aura help
 ```
@@ -64,6 +66,7 @@ Key options:
 
 - `--cwd <path>`
 - `--session <id>`
+- `--resume-latest`
 - `--review`
 - `--var KEY=VALUE` (repeatable)
 - `--base-command <cmd>`

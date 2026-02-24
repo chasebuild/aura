@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aura_contracts::ExecutorKind;
+use aura_contracts::{ExecutorKind, SessionId};
 use aura_executors::adapters::{
     AmpOptions, ClaudeOptions, CodexOptions, CopilotOptions, CursorAgentOptions, DroidOptions,
     GeminiOptions, LocalOptions, OpencodeOptions, QwenCodeOptions,
@@ -31,6 +31,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -42,6 +43,7 @@ pub struct RunOptions {
     pub prompt: String,
     pub cwd: PathBuf,
     pub session_id: Option<String>,
+    pub resume: bool,
     pub review: bool,
     pub env_vars: HashMap<String, String>,
     pub base_command_override: Option<String>,
@@ -57,6 +59,22 @@ pub struct RunOptions {
     pub tui: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SessionContext {
+    session_id: String,
+    executor: ExecutorKind,
+    cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionMetadata {
+    session_id: String,
+    executor: ExecutorKind,
+    cwd: String,
+    created_at: u64,
+    thread_id: Option<String>,
+}
+
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
@@ -64,6 +82,7 @@ impl Default for RunOptions {
             prompt: String::new(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             session_id: None,
+            resume: false,
             review: false,
             env_vars: HashMap::new(),
             base_command_override: None,
@@ -127,6 +146,12 @@ impl LogSink for PlainLogSink {
             options.executor,
             options.cwd.display()
         );
+        if let Some(session_id) = &options.session_id {
+            let _ = writeln!(
+                io::stdout(),
+                "[aura] session: {session_id} (resume with --session {session_id})"
+            );
+        }
     }
 
     fn on_line(&mut self, stream: LogStream, line: &str) {
@@ -767,7 +792,10 @@ impl LogSink for TuiLogSink {
     fn on_start(&mut self, options: &RunOptions) {
         self.started_at = Instant::now();
         self.title = format!("AURA Executor: {:?}", options.executor);
-        self.status = "starting".to_string();
+        self.status = match &options.session_id {
+            Some(session_id) => format!("starting (session {session_id})"),
+            None => "starting".to_string(),
+        };
         self.agent_status = "Initializing".to_string();
         self.usage_status = UsageTracker::new(&options.executor).initial_status();
         self.configure_model_options(&options.executor, options.model.as_deref());
@@ -845,6 +873,8 @@ impl Drop for TuiLogSink {
 #[derive(Debug, Clone)]
 pub enum CliCommand {
     Run(Box<RunOptions>),
+    SessionList,
+    SessionShow { session_id: String },
     Help,
     Completion { shell: Shell },
     LocalExec,
@@ -866,10 +896,22 @@ struct AuraCli {
 enum AuraSubcommand {
     Run(RunCliArgs),
     Tui(RunCliArgs),
+    Session(SessionArgs),
     Help,
     Completion(CompletionArgs),
     #[command(name = "local-exec", hide = true)]
     LocalExec,
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionArgs {
+    List,
+    Show(SessionShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct SessionShowArgs {
+    session_id: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -905,6 +947,8 @@ struct RunCliArgs {
     cwd: Option<PathBuf>,
     #[arg(long = "session")]
     session_id: Option<String>,
+    #[arg(long = "resume-latest")]
+    resume_latest: bool,
     #[arg(long)]
     review: bool,
     #[arg(long = "var", value_name = "KEY=VALUE")]
@@ -961,13 +1005,27 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
         env_vars.insert(key.to_string(), value);
     }
 
+    if args.resume_latest && args.session_id.is_some() {
+        return Err(CliError::Arg(
+            "--resume-latest cannot be combined with --session".to_string(),
+        ));
+    }
+
+    let mut session_id = args.session_id;
+    if args.resume_latest {
+        session_id = latest_session_id().ok_or_else(|| {
+            CliError::Arg("no saved sessions found for --resume-latest".to_string())
+        })?;
+    }
+
     Ok(RunOptions {
         executor: executor_kind_from_arg(args.executor),
         prompt: args.prompt,
         cwd: args
             .cwd
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-        session_id: args.session_id,
+        session_id,
+        resume: args.resume_latest || session_id.is_some(),
         review: args.review,
         env_vars,
         base_command_override: args.base_command_override,
@@ -1011,6 +1069,10 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, CliError> {
         AuraSubcommand::Tui(run_args) => Ok(CliCommand::Run(Box::new(convert_run_cli_args(
             run_args, true,
         )?))),
+        AuraSubcommand::Session(SessionArgs::List) => Ok(CliCommand::SessionList),
+        AuraSubcommand::Session(SessionArgs::Show(args)) => Ok(CliCommand::SessionShow {
+            session_id: args.session_id,
+        }),
         AuraSubcommand::Help => Ok(CliCommand::Help),
         AuraSubcommand::Completion(args) => Ok(CliCommand::Completion { shell: args.shell }),
         AuraSubcommand::LocalExec => Ok(CliCommand::LocalExec),
@@ -1484,6 +1546,149 @@ fn local_session_file(session_id: &str) -> PathBuf {
         .join(format!("{session_id}.json"))
 }
 
+fn session_metadata_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".aura").join("sessions")
+}
+
+fn session_metadata_path(session_id: &str) -> PathBuf {
+    session_metadata_dir().join(format!("{session_id}.json"))
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn write_session_metadata(context: &SessionContext, thread_id: Option<String>) {
+    let existing_thread_id = session_metadata_path(&context.session_id)
+        .exists()
+        .then(|| session_metadata_path(&context.session_id))
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str::<SessionMetadata>(&raw).ok())
+        .and_then(|metadata| metadata.thread_id);
+    let metadata = SessionMetadata {
+        session_id: context.session_id.clone(),
+        executor: context.executor.clone(),
+        cwd: context.cwd.display().to_string(),
+        created_at: now_epoch_secs(),
+        thread_id: thread_id.or(existing_thread_id),
+    };
+    let path = session_metadata_path(&metadata.session_id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(serialized) = serde_json::to_string(&metadata) {
+        let _ = fs::write(path, serialized);
+    }
+}
+
+fn update_session_thread_id(context: &SessionContext, thread_id: &str) {
+    let path = session_metadata_path(&context.session_id);
+    let updated = if let Ok(raw) = fs::read_to_string(&path) {
+        if let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&raw) {
+            metadata.thread_id = Some(thread_id.to_string());
+            metadata
+        } else {
+            SessionMetadata {
+                session_id: context.session_id.clone(),
+                executor: context.executor.clone(),
+                cwd: context.cwd.display().to_string(),
+                created_at: now_epoch_secs(),
+                thread_id: Some(thread_id.to_string()),
+            }
+        }
+    } else {
+        SessionMetadata {
+            session_id: context.session_id.clone(),
+            executor: context.executor.clone(),
+            cwd: context.cwd.display().to_string(),
+            created_at: now_epoch_secs(),
+            thread_id: Some(thread_id.to_string()),
+        }
+    };
+
+    if let Ok(serialized) = serde_json::to_string(&updated) {
+        let _ = fs::write(path, serialized);
+    }
+}
+
+fn read_session_metadata_entries() -> Vec<SessionMetadata> {
+    let dir = session_metadata_dir();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_str::<SessionMetadata>(&raw) else {
+            continue;
+        };
+        out.push(metadata);
+    }
+    out
+}
+
+fn select_latest_session(entries: &[SessionMetadata]) -> Option<SessionMetadata> {
+    entries
+        .iter()
+        .max_by_key(|entry| entry.created_at)
+        .cloned()
+}
+
+fn latest_session_id() -> Option<String> {
+    let entries = read_session_metadata_entries();
+    select_latest_session(&entries).map(|entry| entry.session_id)
+}
+
+pub fn list_sessions() -> String {
+    let mut entries = read_session_metadata_entries();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+    if entries.is_empty() {
+        return "no saved sessions found".to_string();
+    }
+
+    let mut lines = Vec::new();
+    lines.push("session_id | executor | created_at | cwd | thread_id".to_string());
+    for entry in entries {
+        let thread = entry.thread_id.clone().unwrap_or_else(|| "-".to_string());
+        lines.push(format!(
+            "{} | {:?} | {} | {} | {}",
+            entry.session_id, entry.executor, entry.created_at, entry.cwd, thread
+        ));
+    }
+    lines.join("\n")
+}
+
+pub fn show_session(session_id: &str) -> Result<String, CliError> {
+    let path = session_metadata_path(session_id);
+    let raw = fs::read_to_string(&path)
+        .map_err(|_| CliError::Arg(format!("session not found: {session_id}")))?;
+    let metadata = serde_json::from_str::<SessionMetadata>(&raw)
+        .map_err(|_| CliError::Arg(format!("session metadata is invalid: {session_id}")))?;
+    Ok(format!(
+        "Session: {}\nExecutor: {:?}\nCreated: {}\nCwd: {}\nThread: {}",
+        metadata.session_id,
+        metadata.executor,
+        metadata.created_at,
+        metadata.cwd,
+        metadata.thread_id
+            .clone()
+            .unwrap_or_else(|| "n/a".to_string())
+    ))
+}
+
 fn load_local_session_history(session_id: &str) -> Vec<Value> {
     let path = local_session_file(session_id);
     let Ok(raw) = fs::read_to_string(path) else {
@@ -1639,6 +1844,14 @@ async fn run_executor_inner(
     sink: &mut dyn LogSink,
     enable_keyboard_controls: bool,
 ) -> Result<RunOutcome, CliError> {
+    let mut options = options;
+    if options.session_id.is_none() {
+        if let Some(env_session) = options.env_vars.get("AURA_SESSION_ID") {
+            options.session_id = Some(env_session.clone());
+        } else {
+            options.session_id = Some(SessionId::new().0.to_string());
+        }
+    }
     sink.on_start(&options);
     if matches!(options.executor, ExecutorKind::CursorAgent)
         && !(options.force || options.trust || options.yolo)
@@ -1656,6 +1869,28 @@ async fn run_executor_inner(
     for (k, v) in &options.env_vars {
         env.insert(k.clone(), v.clone());
     }
+    if let Some(session_id) = &options.session_id {
+        env.insert("AURA_SESSION_ID", session_id.clone());
+    }
+
+    let session_context = options
+        .session_id
+        .clone()
+        .map(|session_id| SessionContext {
+            session_id,
+            executor: options.executor.clone(),
+            cwd: options.cwd.clone(),
+        });
+    if let Some(context) = &session_context {
+        write_session_metadata(context, None);
+        sink.on_status(&format!(
+            "session: {} (resume with --session {})",
+            context.session_id, context.session_id
+        ));
+        if options.resume {
+            sink.on_status(&format!("resuming session {}", context.session_id));
+        }
+    }
 
     let executor = build_executor(&options);
 
@@ -1668,9 +1903,17 @@ async fn run_executor_inner(
                 &env,
             )
             .await?
-    } else if let Some(session_id) = &options.session_id {
+    } else if options.resume {
         executor
-            .spawn_follow_up(&options.cwd, &options.prompt, session_id, &env)
+            .spawn_follow_up(
+                &options.cwd,
+                &options.prompt,
+                options
+                    .session_id
+                    .as_deref()
+                    .ok_or_else(|| CliError::Runtime("missing session id".to_string()))?,
+                &env,
+            )
             .await?
     } else {
         executor
@@ -1680,6 +1923,7 @@ async fn run_executor_inner(
 
     stream_spawned(
         options.executor.clone(),
+        session_context,
         spawned,
         sink,
         enable_keyboard_controls,
@@ -1816,6 +2060,7 @@ enum DisplayEvent {
     AgentStatus(String),
     UsageStatus(String),
     ModelUnavailable,
+    SessionThreadId(String),
 }
 
 struct LogFormatter {
@@ -1880,10 +2125,21 @@ impl LogFormatter {
 
         let mut events = match event_type {
             "thread.started" => {
-                vec![
-                    DisplayEvent::Status("thread started".to_string()),
+                let thread_id = value
+                    .get("thread_id")
+                    .and_then(Value::as_str)
+                    .map(|value| value.to_string());
+                let mut events = vec![
+                    DisplayEvent::Status(match &thread_id {
+                        Some(id) => format!("thread started (id={id})"),
+                        None => "thread started".to_string(),
+                    }),
                     DisplayEvent::AgentStatus("Initializing".to_string()),
-                ]
+                ];
+                if let Some(id) = thread_id {
+                    events.push(DisplayEvent::SessionThreadId(id));
+                }
+                events
             }
             "turn.started" => vec![
                 DisplayEvent::Status("turn started".to_string()),
@@ -2179,6 +2435,7 @@ fn summarize_text(text: &str, max_len: usize) -> String {
 
 pub async fn stream_spawned(
     executor_kind: ExecutorKind,
+    session_context: Option<SessionContext>,
     mut spawned: SpawnedChild,
     sink: &mut dyn LogSink,
     enable_keyboard_controls: bool,
@@ -2281,6 +2538,11 @@ pub async fn stream_spawned(
                         DisplayEvent::AgentStatus(status) => sink.on_agent_status(&status),
                         DisplayEvent::UsageStatus(status) => sink.on_usage_status(&status),
                         DisplayEvent::ModelUnavailable => sink.on_model_unavailable(),
+                        DisplayEvent::SessionThreadId(thread_id) => {
+                            if let Some(context) = &session_context {
+                                update_session_thread_id(context, &thread_id);
+                            }
+                        }
                     }
                 }
             }
@@ -3011,6 +3273,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             prompt: "ignored".to_string(),
             cwd: PathBuf::from("."),
             session_id: None,
+            resume: false,
             review: false,
             env_vars: HashMap::new(),
             base_command_override: Some("sh".to_string()),
@@ -3044,6 +3307,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             prompt: "ignored".to_string(),
             cwd: PathBuf::from("."),
             session_id: Some("session-xyz".to_string()),
+            resume: true,
             review: false,
             env_vars: HashMap::new(),
             base_command_override: Some("sh".to_string()),
@@ -3075,6 +3339,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             prompt: "ignored".to_string(),
             cwd: PathBuf::from("."),
             session_id: None,
+            resume: false,
             review: false,
             env_vars: HashMap::new(),
             base_command_override: Some("echo".to_string()),

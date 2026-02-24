@@ -1,6 +1,6 @@
 use aura_cli::{
-    CliCommand, completion_script, parse_cli_args, run_local_exec_from_env, run_with_default_sink,
-    usage,
+    CliCommand, completion_script, list_sessions, parse_cli_args, run_local_exec_from_env,
+    run_with_default_sink, show_session, usage,
 };
 
 #[tokio::main]
@@ -22,6 +22,18 @@ async fn main() {
         }
         CliCommand::Completion { shell } => {
             println!("{}", completion_script(shell));
+        }
+        CliCommand::SessionList => {
+            println!("{}", list_sessions());
+        }
+        CliCommand::SessionShow { session_id } => {
+            match show_session(&session_id) {
+                Ok(output) => println!("{output}"),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    std::process::exit(1);
+                }
+            }
         }
         CliCommand::LocalExec => {
             std::process::exit(run_local_exec_from_env().await);
