@@ -2535,7 +2535,7 @@ fn filtered_session_entries(args: &SessionListArgs) -> Vec<SessionMetadata> {
         entries.retain(|entry| entry.executor == executor_kind);
     }
     if let Some(cwd) = args.cwd.as_ref() {
-        entries.retain(|entry| session_cwd_matches(&entry.cwd, &cwd));
+        entries.retain(|entry| session_cwd_matches(&entry.cwd, cwd));
     }
 
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
