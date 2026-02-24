@@ -2932,7 +2932,8 @@ fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> 
 
     match options.executor {
         ExecutorKind::Codex => {
-            let (sandbox, ask_for_approval) = codex_mode_settings(normalized_mode.as_deref());
+            let (sandbox, ask_for_approval) =
+                codex_mode_settings(normalized_mode.as_deref(), options.auto_approve);
             Box::new(adapters::codex(CodexOptions {
                 append_prompt,
                 model: options.model.clone(),
@@ -3050,17 +3051,20 @@ fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> 
     }
 }
 
-fn codex_mode_settings(mode: Option<&str>) -> (Option<String>, Option<String>) {
+fn codex_mode_settings(mode: Option<&str>, auto_approve: bool) -> (Option<String>, Option<String>) {
     match mode {
         Some("plan") => (
             Some("read-only".to_string()),
             Some("on-request".to_string()),
         ),
         Some("yolo") => (
-            Some("workspace-write".to_string()),
+            Some("danger-full-access".to_string()),
             Some("never".to_string()),
         ),
-        _ => (None, None),
+        _ => (
+            Some("workspace-write".to_string()),
+            Some(if auto_approve { "never" } else { "on-request" }.to_string()),
+        ),
     }
 }
 
@@ -4130,9 +4134,23 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
     #[test]
     fn mode_mappings_apply_expected_executor_settings() {
         assert_eq!(
-            codex_mode_settings(Some("plan")),
+            codex_mode_settings(Some("plan"), true),
             (
                 Some("read-only".to_string()),
+                Some("on-request".to_string())
+            )
+        );
+        assert_eq!(
+            codex_mode_settings(None, true),
+            (
+                Some("workspace-write".to_string()),
+                Some("never".to_string())
+            )
+        );
+        assert_eq!(
+            codex_mode_settings(None, false),
+            (
+                Some("workspace-write".to_string()),
                 Some("on-request".to_string())
             )
         );
