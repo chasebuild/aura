@@ -752,8 +752,12 @@ impl TuiLogSink {
         refresh_model_cache: bool,
         local_provider: Option<LocalProvider>,
     ) {
-        self.model_config
-            .configure(executor, selected_model, refresh_model_cache, local_provider);
+        self.model_config.configure(
+            executor,
+            selected_model,
+            refresh_model_cache,
+            local_provider,
+        );
         self.request_redraw(true);
     }
 
@@ -1174,7 +1178,9 @@ fn prompt_for_custom_endpoint() -> Result<String, CliError> {
 
     let trimmed = endpoint.trim();
     if trimmed.is_empty() {
-        return Err(CliError::Arg("custom executor requires an endpoint".to_string()));
+        return Err(CliError::Arg(
+            "custom executor requires an endpoint".to_string(),
+        ));
     }
     Ok(trimmed.to_string())
 }
@@ -1227,9 +1233,7 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
             LocalProvider::LmStudio => {
                 openai_endpoint.or(Some("http://127.0.0.1:1234".to_string()))
             }
-            LocalProvider::Custom => openai_endpoint.or_else(|| {
-                prompt_for_custom_endpoint().ok()
-            }),
+            LocalProvider::Custom => openai_endpoint.or_else(|| prompt_for_custom_endpoint().ok()),
         };
 
         if matches!(provider, LocalProvider::Custom) && openai_endpoint.is_none() {
@@ -1849,7 +1853,10 @@ fn load_model_cache(expected_sources: &[&str]) -> Option<Vec<String>> {
     if cache.version != 1 {
         return None;
     }
-    let expected: HashSet<String> = expected_sources.iter().map(|value| value.to_string()).collect();
+    let expected: HashSet<String> = expected_sources
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
     let actual: HashSet<String> = cache.sources.iter().cloned().collect();
     if expected != actual {
         return None;
@@ -2281,7 +2288,12 @@ async fn run_executor_inner(
     let mut options = options;
     if matches!(options.executor, ExecutorKind::Local)
         && matches!(options.local_provider, Some(LocalProvider::Ollama))
-        && options.model.as_deref().map(str::trim).unwrap_or("").is_empty()
+        && options
+            .model
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
     {
         return Err(CliError::Arg(
             "ollama executor: model is required; pass --model".to_string(),
@@ -2363,6 +2375,7 @@ async fn run_executor_inner(
     stream_spawned(
         options.executor.clone(),
         session_context,
+        options.local_provider,
         spawned,
         sink,
         enable_keyboard_controls,
@@ -2436,8 +2449,7 @@ fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> 
         })),
         ExecutorKind::Local => {
             if matches!(options.local_provider, Some(LocalProvider::Ollama)) {
-                let (model, _) =
-                    resolve_local_model_and_endpoint(options.model.as_deref(), None);
+                let (model, _) = resolve_local_model_and_endpoint(options.model.as_deref(), None);
                 let model = model.unwrap_or_else(|| "llama3".to_string());
                 return Box::new(adapters::ollama_cli(OllamaOptions {
                     append_prompt,
@@ -2518,22 +2530,34 @@ struct LogFormatter {
     suppressed_codex_rollout_warnings: usize,
     emitted_codex_warning_notice: bool,
     usage_tracker: UsageTracker,
+    ollama_in_think: bool,
+    ollama_mode: bool,
 }
 
 impl LogFormatter {
-    fn new(executor: ExecutorKind) -> Self {
+    fn new(executor: ExecutorKind, local_provider: Option<LocalProvider>) -> Self {
         Self {
             usage_tracker: UsageTracker::new(&executor),
             executor,
             suppressed_codex_rollout_warnings: 0,
             emitted_codex_warning_notice: false,
+            ollama_in_think: false,
+            ollama_mode: matches!(local_provider, Some(LocalProvider::Ollama)),
         }
     }
 
     fn format(&mut self, stream: LogStream, raw_line: &str) -> Vec<DisplayEvent> {
-        let line = raw_line.trim_end();
+        let line = raw_line.trim_end().to_string();
         if line.is_empty() {
             return Vec::new();
+        }
+
+        if self.ollama_mode && stream == LogStream::Stdout {
+            let mut events = Vec::new();
+            for line in self.format_ollama_line(&line) {
+                events.push(DisplayEvent::Line(stream, line));
+            }
+            return events;
         }
 
         if line.contains("Workspace Trust Required") {
@@ -2557,16 +2581,62 @@ impl LogFormatter {
                 )];
             }
 
-            if stream == LogStream::Stderr && Self::is_model_refresh_timeout(line) {
+            if stream == LogStream::Stderr && Self::is_model_refresh_timeout(&line) {
                 return vec![DisplayEvent::ModelUnavailable];
             }
 
-            if let Some(formatted) = self.format_codex_event(line) {
+            if let Some(formatted) = self.format_codex_event(&line) {
                 return formatted;
             }
         }
 
-        vec![DisplayEvent::Line(stream, line.to_string())]
+        vec![DisplayEvent::Line(stream, line)]
+    }
+
+    fn format_ollama_line(&mut self, line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut remaining = line;
+
+        loop {
+            if self.ollama_in_think {
+                if let Some(end_idx) = remaining.find("</think>") {
+                    let chunk = &remaining[..end_idx];
+                    self.emit_prefixed_lines("thinking: ", chunk, &mut out);
+                    remaining = &remaining[end_idx + "</think>".len()..];
+                    self.ollama_in_think = false;
+                    if remaining.is_empty() {
+                        break;
+                    }
+                    continue;
+                }
+                self.emit_prefixed_lines("thinking: ", remaining, &mut out);
+                break;
+            } else if let Some(start_idx) = remaining.find("<think>") {
+                let before = &remaining[..start_idx];
+                self.emit_prefixed_lines("agent: ", before, &mut out);
+                remaining = &remaining[start_idx + "<think>".len()..];
+                self.ollama_in_think = true;
+                if remaining.is_empty() {
+                    break;
+                }
+                continue;
+            } else {
+                self.emit_prefixed_lines("agent: ", remaining, &mut out);
+                break;
+            }
+        }
+
+        out
+    }
+
+    fn emit_prefixed_lines(&self, prefix: &str, text: &str, out: &mut Vec<String>) {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            out.push(format!("{prefix}{trimmed}"));
+        }
     }
 
     fn format_codex_event(&mut self, line: &str) -> Option<Vec<DisplayEvent>> {
@@ -2886,6 +2956,7 @@ fn summarize_text(text: &str, max_len: usize) -> String {
 pub(crate) async fn stream_spawned(
     executor_kind: ExecutorKind,
     session_context: Option<SessionContext>,
+    local_provider: Option<LocalProvider>,
     mut spawned: SpawnedChild,
     sink: &mut dyn LogSink,
     enable_keyboard_controls: bool,
@@ -2920,7 +2991,7 @@ pub(crate) async fn stream_spawned(
     let mut streams_closed = 0usize;
     let mut exit_code: Option<i32> = None;
     let mut got_exit_status = false;
-    let mut formatter = LogFormatter::new(executor_kind);
+    let mut formatter = LogFormatter::new(executor_kind, local_provider);
     let mut last_wait_status_at = Instant::now();
     let mut quit_requested_at: Option<Instant> = None;
     let mut user_requested_exit = false;
