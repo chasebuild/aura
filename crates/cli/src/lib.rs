@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aura_contracts::{ExecutorKind, SessionId};
@@ -23,6 +23,10 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use duct::cmd;
+use pulldown_cmark::{
+    Event as MdEvent, HeadingLevel as MdHeadingLevel, Options as MdOptions, Parser as MdParser,
+    Tag as MdTag, TagEnd as MdTagEnd,
+};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -234,6 +238,7 @@ pub struct TuiLogSink {
 enum TuiLineKind {
     User,
     Agent,
+    AgentMarkdown,
     Code,
     Json,
     Diff,
@@ -345,6 +350,9 @@ fn classify_tui_line(stream: LogStream, line: &str) -> TuiLineKind {
     if line.starts_with("user: ") {
         return TuiLineKind::User;
     }
+    if line.starts_with("agent_md: ") {
+        return TuiLineKind::AgentMarkdown;
+    }
     if line.starts_with("code: ") || line.starts_with("code| ") {
         return TuiLineKind::Code;
     }
@@ -372,6 +380,7 @@ fn classify_tui_line(stream: LogStream, line: &str) -> TuiLineKind {
 fn normalize_tui_line_text(kind: TuiLineKind, line: &str) -> String {
     let normalized = match kind {
         TuiLineKind::User => line.trim_start_matches("user: ").to_string(),
+        TuiLineKind::AgentMarkdown => line.trim_start_matches("agent_md: ").to_string(),
         TuiLineKind::Agent => line.trim_start_matches("agent: ").to_string(),
         TuiLineKind::Code => line
             .trim_start_matches("code: ")
@@ -388,6 +397,181 @@ fn normalize_tui_line_text(kind: TuiLineKind, line: &str) -> String {
         TuiLineKind::Output => line.to_string(),
     };
     sanitize_tui_text(&normalized)
+}
+
+fn render_markdown_lines(text: &str) -> Vec<Line<'static>> {
+    let mut options = MdOptions::empty();
+    options.insert(MdOptions::ENABLE_STRIKETHROUGH);
+    options.insert(MdOptions::ENABLE_TABLES);
+    let parser = MdParser::new_ext(text, options);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut style_stack: Vec<Style> = vec![Style::default().fg(Color::White)];
+    let mut in_codeblock = false;
+    let code_style = Style::default().fg(Color::Green);
+    let mut list_stack: Vec<(bool, usize)> = Vec::new();
+    let mut blockquote_depth: usize = 0;
+
+    let push_line = |lines: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>| {
+        if current.is_empty() {
+            return;
+        }
+        lines.push(Line::from(std::mem::take(current)));
+    };
+
+    let push_blank = |lines: &mut Vec<Line<'static>>| {
+        lines.push(Line::from(Span::raw("")));
+    };
+
+    for event in parser {
+        match event {
+            MdEvent::Start(tag) => match tag {
+                MdTag::Paragraph => {}
+                MdTag::Heading { level, .. } => {
+                    push_line(&mut lines, &mut current);
+                    let style = Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::BOLD);
+                    style_stack.push(style);
+                    current.push(Span::raw(format!(
+                        "{} ",
+                        "#".repeat(heading_level_to_usize(level))
+                    )));
+                }
+                MdTag::BlockQuote => {
+                    blockquote_depth += 1;
+                }
+                MdTag::List(start) => {
+                    let ordered = start.is_some();
+                    let index = start.unwrap_or(0) as usize;
+                    list_stack.push((ordered, index));
+                }
+                MdTag::Item => {
+                    if let Some((ordered, index)) = list_stack.last_mut() {
+                        let prefix = if *ordered {
+                            let num = *index + 1;
+                            *index += 1;
+                            format!("{num}. ")
+                        } else {
+                            "• ".to_string()
+                        };
+                        current.push(Span::styled(prefix, Style::default().fg(Color::White)));
+                    }
+                }
+                MdTag::Emphasis => {
+                    let style = style_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_default()
+                        .add_modifier(ratatui::style::Modifier::ITALIC);
+                    style_stack.push(style);
+                }
+                MdTag::Strong => {
+                    let style = style_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_default()
+                        .add_modifier(ratatui::style::Modifier::BOLD);
+                    style_stack.push(style);
+                }
+                MdTag::Strikethrough => {
+                    let style = style_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_default()
+                        .add_modifier(ratatui::style::Modifier::CROSSED_OUT);
+                    style_stack.push(style);
+                }
+                MdTag::CodeBlock(_) => {
+                    push_line(&mut lines, &mut current);
+                    in_codeblock = true;
+                }
+                MdTag::Link { .. } => {
+                    let style = style_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::UNDERLINED);
+                    style_stack.push(style);
+                }
+                _ => {}
+            },
+            MdEvent::End(tag) => match tag {
+                MdTagEnd::Paragraph => {
+                    push_line(&mut lines, &mut current);
+                    push_blank(&mut lines);
+                }
+                MdTagEnd::Heading(_) => {
+                    push_line(&mut lines, &mut current);
+                    push_blank(&mut lines);
+                    style_stack.pop();
+                }
+                MdTagEnd::BlockQuote => {
+                    blockquote_depth = blockquote_depth.saturating_sub(1);
+                }
+                MdTagEnd::List(_) => {
+                    list_stack.pop();
+                    push_blank(&mut lines);
+                }
+                MdTagEnd::Item => {
+                    push_line(&mut lines, &mut current);
+                }
+                MdTagEnd::Emphasis
+                | MdTagEnd::Strong
+                | MdTagEnd::Strikethrough
+                | MdTagEnd::Link => {
+                    style_stack.pop();
+                }
+                MdTagEnd::CodeBlock => {
+                    in_codeblock = false;
+                    push_blank(&mut lines);
+                }
+                _ => {}
+            },
+            MdEvent::Text(text) => {
+                if in_codeblock {
+                    for line in text.lines() {
+                        lines.push(Line::from(Span::styled(line.to_string(), code_style)));
+                    }
+                } else {
+                    if blockquote_depth > 0 && current.is_empty() {
+                        current.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
+                    }
+                    current.push(Span::styled(
+                        text.to_string(),
+                        style_stack.last().copied().unwrap_or_default(),
+                    ));
+                }
+            }
+            MdEvent::Code(code) => {
+                let style = Style::default().fg(Color::Yellow);
+                current.push(Span::styled(code.to_string(), style));
+            }
+            MdEvent::SoftBreak | MdEvent::HardBreak => {
+                push_line(&mut lines, &mut current);
+            }
+            _ => {}
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+
+    lines
+}
+
+fn heading_level_to_usize(level: MdHeadingLevel) -> usize {
+    match level {
+        MdHeadingLevel::H1 => 1,
+        MdHeadingLevel::H2 => 2,
+        MdHeadingLevel::H3 => 3,
+        MdHeadingLevel::H4 => 4,
+        MdHeadingLevel::H5 => 5,
+        MdHeadingLevel::H6 => 6,
+    }
 }
 
 fn normalize_thinking_text(text: &str) -> String {
@@ -530,72 +714,84 @@ impl TuiLogSink {
                 .take(end - start)
                 .cloned()
                 .collect();
-            let log_lines: Vec<Line> = visible_logs
-                .into_iter()
-                .map(|entry| match entry.kind {
-                    TuiLineKind::User => Line::from(vec![
+            let mut log_lines: Vec<Line> = Vec::new();
+            for entry in visible_logs {
+                match entry.kind {
+                    TuiLineKind::User => log_lines.push(Line::from(vec![
                         Span::styled(" USER ", Style::default().fg(Color::Black).bg(Color::White)),
                         Span::raw(" "),
                         Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Gray)),
                         Span::styled(entry.text, Style::default().fg(Color::Black).bg(Color::Gray)),
                         Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Gray)),
-                    ]),
-                    TuiLineKind::Agent => Line::from(vec![
+                    ])),
+                    TuiLineKind::Agent => log_lines.push(Line::from(vec![
                         Span::styled(" AGENT ", Style::default().fg(Color::White)),
                         Span::raw(" "),
                         Span::styled(" ", Style::default().fg(Color::White)),
                         Span::styled(entry.text, Style::default().fg(Color::White)),
                         Span::styled(" ", Style::default().fg(Color::White)),
-                    ]),
-                    TuiLineKind::Code => Line::from(vec![
+                    ])),
+                    TuiLineKind::AgentMarkdown => {
+                        let rendered = render_markdown_lines(&entry.text);
+                        if rendered.is_empty() {
+                            continue;
+                        }
+                        log_lines.push(Line::from(vec![
+                            Span::styled(" AGENT ", Style::default().fg(Color::White)),
+                            Span::raw(" "),
+                            Span::styled(" ", Style::default().fg(Color::White)),
+                        ]));
+                        log_lines.extend(rendered);
+                    }
+                    TuiLineKind::Code => log_lines.push(Line::from(vec![
                         Span::styled(
                             " CODE ",
                             Style::default().fg(Color::White).bg(Color::DarkGray),
                         ),
                         Span::raw(" "),
                         Span::styled(entry.text, Style::default().fg(Color::Gray)),
-                    ]),
-                    TuiLineKind::Json => Line::from(vec![
+                    ])),
+                    TuiLineKind::Json => log_lines.push(Line::from(vec![
                         Span::styled(" JSON ", Style::default().fg(Color::Black).bg(Color::Green)),
                         Span::raw(" "),
                         Span::styled(entry.text, Style::default().fg(Color::Green)),
-                    ]),
-                    TuiLineKind::Diff => Line::from(vec![
+                    ])),
+                    TuiLineKind::Diff => log_lines.push(Line::from(vec![
                         Span::styled(
                             " DIFF ",
                             Style::default().fg(Color::White).bg(Color::Magenta),
                         ),
                         Span::raw(" "),
                         Span::styled(entry.text.clone(), diff_line_style(&entry.text)),
-                    ]),
-                    TuiLineKind::Thinking => Line::from(vec![
+                    ])),
+                    TuiLineKind::Thinking => log_lines.push(Line::from(vec![
                         Span::styled(
                             " THINK ",
                             Style::default().fg(Color::Black).bg(Color::Yellow),
                         ),
                         Span::raw(" "),
                         Span::styled(entry.text, Style::default().fg(Color::Yellow)),
-                    ]),
-                    TuiLineKind::Action => Line::from(vec![
+                    ])),
+                    TuiLineKind::Action => log_lines.push(Line::from(vec![
                         Span::styled(
                             " ACTION ",
                             Style::default().fg(Color::White).bg(Color::Blue),
                         ),
                         Span::raw(" "),
                         Span::styled(entry.text, Style::default().fg(Color::Blue)),
-                    ]),
-                    TuiLineKind::Error => Line::from(vec![
+                    ])),
+                    TuiLineKind::Error => log_lines.push(Line::from(vec![
                         Span::styled(" ERROR ", Style::default().fg(Color::White).bg(Color::Red)),
                         Span::raw(" "),
                         Span::styled(entry.text, Style::default().fg(Color::Red)),
-                    ]),
-                    TuiLineKind::Output => Line::from(vec![
+                    ])),
+                    TuiLineKind::Output => log_lines.push(Line::from(vec![
                         Span::styled(" OUT ", Style::default().fg(Color::Black).bg(Color::Green)),
                         Span::raw(" "),
                         Span::raw(entry.text),
-                    ]),
-                })
-                .collect();
+                    ])),
+                }
+            }
 
             let logs_title = if max_log_scroll == 0 {
                 "Logs".to_string()
@@ -1186,6 +1382,9 @@ fn prompt_for_custom_endpoint() -> Result<String, CliError> {
 }
 
 fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions, CliError> {
+    let executor_arg = args.executor;
+    let legacy_custom_command =
+        matches!(executor_arg, ExecutorArg::Custom) && args.base_command_override.is_some();
     let mut env_vars = HashMap::new();
     for pair in args.env_vars {
         let mut parts = pair.splitn(2, '=');
@@ -1203,7 +1402,11 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
         ));
     }
 
-    let local_provider = local_provider_from_executor_arg(args.executor);
+    let local_provider = if legacy_custom_command {
+        None
+    } else {
+        local_provider_from_executor_arg(executor_arg)
+    };
     let mut session_id = args.session_id;
     if args.resume_latest {
         session_id = Some(latest_session_id().ok_or_else(|| {
@@ -1244,7 +1447,11 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
     }
 
     Ok(RunOptions {
-        executor: executor_kind_from_arg(args.executor),
+        executor: if legacy_custom_command {
+            ExecutorKind::Custom("custom".to_string())
+        } else {
+            executor_kind_from_arg(executor_arg)
+        },
         prompt: args.prompt,
         cwd: args
             .cwd
@@ -2064,10 +2271,12 @@ fn latest_session_id() -> Option<String> {
     select_latest_session(&entries).map(|entry| entry.session_id)
 }
 
-fn session_cwd_matches(entry_cwd: &str, filter_cwd: &PathBuf) -> bool {
+fn session_cwd_matches(entry_cwd: &str, filter_cwd: &Path) -> bool {
     let entry_path = PathBuf::from(entry_cwd);
     let entry_canon = entry_path.canonicalize().unwrap_or(entry_path.clone());
-    let filter_canon = filter_cwd.canonicalize().unwrap_or(filter_cwd.clone());
+    let filter_canon = filter_cwd
+        .canonicalize()
+        .unwrap_or_else(|_| filter_cwd.to_path_buf());
     entry_canon == filter_canon || entry_cwd == filter_cwd.display().to_string()
 }
 
@@ -2523,6 +2732,7 @@ enum DisplayEvent {
     UsageStatus(String),
     ModelUnavailable,
     SessionThreadId(String),
+    AgentMarkdown(String),
 }
 
 struct LogFormatter {
@@ -2748,9 +2958,10 @@ impl LogFormatter {
                         if text.is_empty() {
                             return None;
                         }
-                        let mut events = format_agent_message(text);
-                        events.push(DisplayEvent::AgentStatus("Responding".to_string()));
-                        events
+                        vec![
+                            DisplayEvent::AgentMarkdown(text.to_string()),
+                            DisplayEvent::AgentStatus("Responding".to_string()),
+                        ]
                     }
                     "reasoning" => {
                         let text = item.get("text").and_then(Value::as_str).unwrap_or("");
@@ -2788,157 +2999,6 @@ impl LogFormatter {
         line.contains("failed to refresh available models")
             && line.contains("timeout waiting for child process to exit")
     }
-}
-
-fn format_agent_message(text: &str) -> Vec<DisplayEvent> {
-    let mut events = Vec::new();
-    let mut prose_lines: Vec<String> = Vec::new();
-    let mut fence_lines: Vec<String> = Vec::new();
-    let mut in_fence = false;
-    let mut fence_lang = String::new();
-
-    for raw_line in text.lines() {
-        let line = raw_line.trim_end();
-        let marker = line.trim_start();
-        if marker.starts_with("```") {
-            if in_fence {
-                emit_code_fence(&mut events, &fence_lang, &fence_lines);
-                fence_lines.clear();
-                in_fence = false;
-                fence_lang.clear();
-            } else {
-                emit_prose_block(&mut events, &prose_lines);
-                prose_lines.clear();
-                in_fence = true;
-                fence_lang = marker.trim_start_matches("```").trim().to_string();
-            }
-            continue;
-        }
-
-        if in_fence {
-            fence_lines.push(line.to_string());
-        } else {
-            prose_lines.push(line.to_string());
-        }
-    }
-
-    if in_fence {
-        emit_code_fence(&mut events, &fence_lang, &fence_lines);
-    } else {
-        emit_prose_block(&mut events, &prose_lines);
-    }
-
-    if events.is_empty() {
-        events.push(DisplayEvent::Line(
-            LogStream::Stdout,
-            "agent: (empty message)".to_string(),
-        ));
-    }
-    events
-}
-
-fn emit_prose_block(events: &mut Vec<DisplayEvent>, lines: &[String]) {
-    if lines.is_empty() {
-        return;
-    }
-    let non_empty: Vec<String> = lines
-        .iter()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-        .collect();
-    if non_empty.is_empty() {
-        return;
-    }
-
-    if looks_like_diff_block(&non_empty) {
-        for line in non_empty {
-            events.push(DisplayEvent::Line(
-                LogStream::Stdout,
-                format!("diff| {line}"),
-            ));
-        }
-        return;
-    }
-
-    for line in non_empty {
-        events.push(DisplayEvent::Line(
-            LogStream::Stdout,
-            format!("agent: {}", summarize_text(&line, 220)),
-        ));
-    }
-}
-
-fn emit_code_fence(events: &mut Vec<DisplayEvent>, lang: &str, lines: &[String]) {
-    if lines.is_empty() {
-        return;
-    }
-    let content = lines.join("\n");
-    let lang_lower = lang.trim().to_ascii_lowercase();
-
-    if lang_lower == "json" || lang_lower == "jsonc" {
-        if let Ok(value) = serde_json::from_str::<Value>(&content) {
-            events.push(DisplayEvent::Line(
-                LogStream::Stdout,
-                "json: block".to_string(),
-            ));
-            if let Ok(pretty) = serde_json::to_string_pretty(&value) {
-                for line in pretty.lines() {
-                    events.push(DisplayEvent::Line(
-                        LogStream::Stdout,
-                        format!("json| {line}"),
-                    ));
-                }
-                return;
-            }
-        }
-    }
-
-    if lang_lower.contains("diff") || lang_lower.contains("patch") || looks_like_diff_block(lines) {
-        for line in lines {
-            events.push(DisplayEvent::Line(
-                LogStream::Stdout,
-                format!("diff| {line}"),
-            ));
-        }
-        return;
-    }
-
-    let code_header = if lang.trim().is_empty() {
-        "code: block".to_string()
-    } else {
-        format!("code: {}", lang.trim())
-    };
-    events.push(DisplayEvent::Line(LogStream::Stdout, code_header));
-    for line in lines {
-        events.push(DisplayEvent::Line(
-            LogStream::Stdout,
-            format!("code| {line}"),
-        ));
-    }
-}
-
-fn looks_like_diff_block(lines: &[String]) -> bool {
-    if lines.is_empty() {
-        return false;
-    }
-
-    let mut score = 0usize;
-    for line in lines {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("diff --git")
-            || trimmed.starts_with("@@")
-            || trimmed.starts_with("--- ")
-            || trimmed.starts_with("+++ ")
-            || trimmed.starts_with("index ")
-        {
-            score += 2;
-            continue;
-        }
-        if trimmed.starts_with('+') || trimmed.starts_with('-') {
-            score += 1;
-        }
-    }
-    score >= 3
 }
 
 fn summarize_text(text: &str, max_len: usize) -> String {
@@ -3065,6 +3125,9 @@ pub(crate) async fn stream_spawned(
                             if let Some(context) = &session_context {
                                 update_session_thread_id(context, &thread_id);
                             }
+                        }
+                        DisplayEvent::AgentMarkdown(markdown) => {
+                            sink.on_line(LogStream::Stdout, &format!("agent_md: {markdown}"));
                         }
                     }
                 }
@@ -3425,6 +3488,28 @@ mod tests {
     }
 
     #[test]
+    fn custom_with_base_command_uses_legacy_custom_executor() {
+        let args = vec![
+            "run".to_string(),
+            "--executor".to_string(),
+            "custom".to_string(),
+            "--prompt".to_string(),
+            "hi".to_string(),
+            "--base-command".to_string(),
+            "sh".to_string(),
+        ];
+
+        let parsed = parse_cli_args(&args).expect("parse");
+        match parsed {
+            CliCommand::Run(opts) => {
+                assert!(matches!(opts.executor, ExecutorKind::Custom(_)));
+                assert!(opts.local_provider.is_none());
+            }
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
     fn local_model_resolution_strips_prefix_and_infers_endpoint() {
         let (model, endpoint) = resolve_local_model_and_endpoint(Some("lmstudio/qwen2.5"), None);
         assert_eq!(model.as_deref(), Some("qwen2.5"));
@@ -3656,7 +3741,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
 
     #[test]
     fn codex_json_logs_are_humanized() {
-        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex, None);
         let events = formatter.format(
             LogStream::Stdout,
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"hello from agent"}}"#,
@@ -3664,7 +3749,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
 
         assert!(events.iter().any(|event| matches!(
             event,
-            DisplayEvent::Line(LogStream::Stdout, line) if line.contains("agent: hello from agent")
+            DisplayEvent::AgentMarkdown(text) if text == "hello from agent"
         )));
         assert!(events.iter().any(|event| matches!(
             event,
@@ -3674,7 +3759,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
 
     #[test]
     fn codex_agent_message_formats_json_and_code_blocks() {
-        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex, None);
         let events = formatter.format(
             LogStream::Stdout,
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"Here is data:\n```json\n{\"ok\":true,\"count\":2}\n```\nAnd code:\n```rust\nfn main() {}\n```"}}"#,
@@ -3682,25 +3767,13 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
 
         assert!(events.iter().any(|event| matches!(
             event,
-            DisplayEvent::Line(LogStream::Stdout, line) if line == "agent: Here is data:"
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            DisplayEvent::Line(LogStream::Stdout, line) if line.starts_with("json| {")
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            DisplayEvent::Line(LogStream::Stdout, line) if line == "code: rust"
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            DisplayEvent::Line(LogStream::Stdout, line) if line.contains("code| fn main() {}")
+            DisplayEvent::AgentMarkdown(text) if text.contains("Here is data:")
         )));
     }
 
     #[test]
     fn codex_agent_message_formats_diff_blocks() {
-        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex, None);
         let events = formatter.format(
             LogStream::Stdout,
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"```diff\n@@ -1 +1 @@\n-old\n+new\n```"}}"#,
@@ -3708,21 +3781,13 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
 
         assert!(events.iter().any(|event| matches!(
             event,
-            DisplayEvent::Line(LogStream::Stdout, line) if line == "diff| @@ -1 +1 @@"
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            DisplayEvent::Line(LogStream::Stdout, line) if line == "diff| -old"
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            DisplayEvent::Line(LogStream::Stdout, line) if line == "diff| +new"
+            DisplayEvent::AgentMarkdown(text) if text.contains("@@ -1 +1 @@")
         )));
     }
 
     #[test]
     fn codex_rollout_warning_is_suppressed_after_notice() {
-        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex, None);
         let warning = "2026-01-01 ERROR codex_core::rollout::list: state db missing rollout path for thread abc";
 
         let first = formatter.format(LogStream::Stderr, warning);
@@ -3736,7 +3801,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
 
     #[test]
     fn codex_model_refresh_timeout_sets_model_unavailable_without_log_line() {
-        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex, None);
         let warning = "2026-02-23T10:45:31.760202Z ERROR codex_core::models_manager::manager: failed to refresh available models: timeout waiting for child process to exit";
 
         let events = formatter.format(LogStream::Stderr, warning);
@@ -3747,7 +3812,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
 
     #[test]
     fn codex_reasoning_can_set_planning_status() {
-        let mut formatter = LogFormatter::new(ExecutorKind::Codex);
+        let mut formatter = LogFormatter::new(ExecutorKind::Codex, None);
         let events = formatter.format(
             LogStream::Stdout,
             r#"{"type":"item.completed","item":{"type":"reasoning","text":"**Planning fixes**"}}"#,
@@ -3806,7 +3871,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             env_vars: HashMap::new(),
             base_command_override: Some("sh".to_string()),
             additional_params: vec![
-                "-lc".to_string(),
+                "-c".to_string(),
                 "echo out_line; echo err_line 1>&2".to_string(),
             ],
             append_prompt: None,
@@ -3843,7 +3908,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             env_vars: HashMap::new(),
             base_command_override: Some("sh".to_string()),
             additional_params: vec![
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf %s \"$AURA_SESSION_ID\"".to_string(),
             ],
             append_prompt: None,

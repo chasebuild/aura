@@ -601,7 +601,7 @@ mod tests {
     async fn prompt_mode_arg_passes_prompt_as_argument() {
         let executor = CommandBackedExecutor::new(CommandExecutorConfig {
             profile_id: ExecutorProfileId::new(ExecutorKind::Custom("arg-test".to_string())),
-            base_command: "python".to_string(),
+            base_command: "python3".to_string(),
             default_params: vec![
                 "-c".to_string(),
                 "import sys; print(sys.argv[1])".to_string(),
