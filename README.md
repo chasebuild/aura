@@ -42,6 +42,7 @@ Usage:
   aura tui --executor <name> --prompt <text> [options]
   aura session list
   aura session show <session_id>
+  aura session latest
   aura completion <shell>
   aura help
 ```

@@ -873,8 +873,9 @@ impl Drop for TuiLogSink {
 #[derive(Debug, Clone)]
 pub enum CliCommand {
     Run(Box<RunOptions>),
-    SessionList,
+    SessionList(SessionListArgs),
     SessionShow { session_id: String },
+    SessionLatest,
     Help,
     Completion { shell: Shell },
     LocalExec,
@@ -905,13 +906,24 @@ enum AuraSubcommand {
 
 #[derive(Debug, Subcommand)]
 enum SessionArgs {
-    List,
+    List(SessionListArgs),
     Show(SessionShowArgs),
+    Latest,
 }
 
 #[derive(Debug, Args)]
 struct SessionShowArgs {
     session_id: String,
+}
+
+#[derive(Debug, Args, Clone)]
+struct SessionListArgs {
+    #[arg(long, value_enum)]
+    executor: Option<ExecutorArg>,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1069,10 +1081,11 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, CliError> {
         AuraSubcommand::Tui(run_args) => Ok(CliCommand::Run(Box::new(convert_run_cli_args(
             run_args, true,
         )?))),
-        AuraSubcommand::Session(SessionArgs::List) => Ok(CliCommand::SessionList),
+        AuraSubcommand::Session(SessionArgs::List(args)) => Ok(CliCommand::SessionList(args)),
         AuraSubcommand::Session(SessionArgs::Show(args)) => Ok(CliCommand::SessionShow {
             session_id: args.session_id,
         }),
+        AuraSubcommand::Session(SessionArgs::Latest) => Ok(CliCommand::SessionLatest),
         AuraSubcommand::Help => Ok(CliCommand::Help),
         AuraSubcommand::Completion(args) => Ok(CliCommand::Completion { shell: args.shell }),
         AuraSubcommand::LocalExec => Ok(CliCommand::LocalExec),
@@ -1652,9 +1665,28 @@ fn latest_session_id() -> Option<String> {
     select_latest_session(&entries).map(|entry| entry.session_id)
 }
 
-pub fn list_sessions() -> String {
+fn session_cwd_matches(entry_cwd: &str, filter_cwd: &PathBuf) -> bool {
+    let entry_path = PathBuf::from(entry_cwd);
+    let entry_canon = entry_path.canonicalize().unwrap_or(entry_path.clone());
+    let filter_canon = filter_cwd.canonicalize().unwrap_or(filter_cwd.clone());
+    entry_canon == filter_canon || entry_cwd == filter_cwd.display().to_string()
+}
+
+pub fn list_sessions(args: SessionListArgs) -> String {
     let mut entries = read_session_metadata_entries();
+    if let Some(executor) = args.executor {
+        let executor_kind = executor_kind_from_arg(executor);
+        entries.retain(|entry| entry.executor == executor_kind);
+    }
+    if let Some(cwd) = args.cwd {
+        entries.retain(|entry| session_cwd_matches(&entry.cwd, &cwd));
+    }
+
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+    if let Some(limit) = args.limit {
+        entries.truncate(limit);
+    }
+
     if entries.is_empty() {
         return "no saved sessions found".to_string();
     }
@@ -1669,6 +1701,10 @@ pub fn list_sessions() -> String {
         ));
     }
     lines.join("\n")
+}
+
+pub fn latest_session() -> Result<String, CliError> {
+    latest_session_id().ok_or_else(|| CliError::Arg("no saved sessions found".to_string()))
 }
 
 pub fn show_session(session_id: &str) -> Result<String, CliError> {
