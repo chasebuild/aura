@@ -541,11 +541,11 @@ impl TuiLogSink {
                         Span::styled(" ", Style::default().fg(Color::Black).bg(Color::Gray)),
                     ]),
                     TuiLineKind::Agent => Line::from(vec![
-                        Span::styled(" AGENT ", Style::default().fg(Color::White).bg(Color::Black)),
+                        Span::styled(" AGENT ", Style::default().fg(Color::White)),
                         Span::raw(" "),
-                        Span::styled(" ", Style::default().fg(Color::White).bg(Color::Black)),
-                        Span::styled(entry.text, Style::default().fg(Color::White).bg(Color::Black)),
-                        Span::styled(" ", Style::default().fg(Color::White).bg(Color::Black)),
+                        Span::styled(" ", Style::default().fg(Color::White)),
+                        Span::styled(entry.text, Style::default().fg(Color::White)),
+                        Span::styled(" ", Style::default().fg(Color::White)),
                     ]),
                     TuiLineKind::Code => Line::from(vec![
                         Span::styled(
