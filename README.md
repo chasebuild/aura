@@ -68,6 +68,7 @@ Key options:
 - `--cwd <path>`
 - `--session <id>`
 - `--resume-latest`
+- `--refresh-model-cache`
 - `--review`
 - `--var KEY=VALUE` (repeatable)
 - `--base-command <cmd>`
@@ -80,6 +81,7 @@ Key options:
 - `--trust`
 - `--auto-approve <true|false>`
 - `--allow-all-tools`
+- `--executor-path <name=path>` (repeatable)
 - `--no-tui`
 
 For `--executor local`, if `--model` is omitted, the CLI prompts you to select from discovered local models (default is the first discovered model).

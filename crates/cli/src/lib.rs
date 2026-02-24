@@ -44,6 +44,7 @@ pub struct RunOptions {
     pub cwd: PathBuf,
     pub session_id: Option<String>,
     pub resume: bool,
+    pub refresh_model_cache: bool,
     pub review: bool,
     pub env_vars: HashMap<String, String>,
     pub base_command_override: Option<String>,
@@ -56,6 +57,7 @@ pub struct RunOptions {
     pub trust: bool,
     pub auto_approve: bool,
     pub allow_all_tools: bool,
+    pub executor_paths: HashMap<String, String>,
     pub tui: bool,
 }
 
@@ -75,6 +77,28 @@ struct SessionMetadata {
     thread_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionIndexEntry {
+    session_id: String,
+    executor: ExecutorKind,
+    cwd: String,
+    created_at: u64,
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelCache {
+    version: u8,
+    updated_at: u64,
+    models: Vec<String>,
+    sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ExecutorPathCache {
+    entries: HashMap<String, String>,
+}
+
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
@@ -83,6 +107,7 @@ impl Default for RunOptions {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             session_id: None,
             resume: false,
+            refresh_model_cache: false,
             review: false,
             env_vars: HashMap::new(),
             base_command_override: None,
@@ -95,6 +120,7 @@ impl Default for RunOptions {
             trust: false,
             auto_approve: true,
             allow_all_tools: false,
+            executor_paths: HashMap::new(),
             tui: true,
         }
     }
@@ -132,6 +158,7 @@ pub trait LogSink {
     fn on_agent_status(&mut self, _message: &str) {}
     fn on_usage_status(&mut self, _message: &str) {}
     fn on_model_unavailable(&mut self) {}
+    fn flush(&mut self) {}
     fn on_exit(&mut self, code: Option<i32>);
     fn on_key_event(&mut self, _key: KeyEvent) {}
 }
@@ -187,6 +214,9 @@ pub struct TuiLogSink {
     input_text: String,
     active_pane: TuiPane,
     model_config: ModelConfiguration,
+    last_redraw: Instant,
+    redraw_interval: Duration,
+    pending_redraw: bool,
     terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
 }
 
@@ -232,8 +262,13 @@ impl ModelConfiguration {
         }
     }
 
-    fn configure(&mut self, executor: &ExecutorKind, selected_model: Option<&str>) {
-        self.options = model_options_for_executor(executor);
+    fn configure(
+        &mut self,
+        executor: &ExecutorKind,
+        selected_model: Option<&str>,
+        refresh_model_cache: bool,
+    ) {
+        self.options = model_options_for_executor(executor, refresh_model_cache);
         self.unavailable = false;
 
         if let Some(model) = selected_model {
@@ -398,8 +433,9 @@ fn sanitize_tui_text(input: &str) -> String {
 impl TuiLogSink {
     pub fn new() -> Self {
         let terminal = Self::init_terminal();
+        let now = Instant::now();
         Self {
-            started_at: Instant::now(),
+            started_at: now,
             lines: VecDeque::new(),
             max_lines: 500,
             log_scroll: 0,
@@ -410,6 +446,9 @@ impl TuiLogSink {
             input_text: String::new(),
             active_pane: TuiPane::Prompt,
             model_config: ModelConfiguration::new(),
+            last_redraw: now,
+            redraw_interval: Duration::from_millis(33),
+            pending_redraw: false,
             terminal,
         }
     }
@@ -661,6 +700,17 @@ impl TuiLogSink {
         });
     }
 
+    fn request_redraw(&mut self, force: bool) {
+        let now = Instant::now();
+        if force || now.duration_since(self.last_redraw) >= self.redraw_interval {
+            self.last_redraw = now;
+            self.pending_redraw = false;
+            self.redraw();
+        } else {
+            self.pending_redraw = true;
+        }
+    }
+
     fn set_input_text(&mut self, input: String) {
         self.input_text = input;
         self.redraw();
@@ -681,12 +731,18 @@ impl TuiLogSink {
             TuiPane::Prompt => TuiPane::Model,
             TuiPane::Model => TuiPane::Logs,
         };
-        self.redraw();
+        self.request_redraw(true);
     }
 
-    fn configure_model_options(&mut self, executor: &ExecutorKind, selected_model: Option<&str>) {
-        self.model_config.configure(executor, selected_model);
-        self.redraw();
+    fn configure_model_options(
+        &mut self,
+        executor: &ExecutorKind,
+        selected_model: Option<&str>,
+        refresh_model_cache: bool,
+    ) {
+        self.model_config
+            .configure(executor, selected_model, refresh_model_cache);
+        self.request_redraw(true);
     }
 
     fn selected_model(&self) -> Option<String> {
@@ -695,17 +751,17 @@ impl TuiLogSink {
 
     fn cycle_model_next(&mut self) {
         self.model_config.cycle_next();
-        self.redraw();
+        self.request_redraw(true);
     }
 
     fn cycle_model_prev(&mut self) {
         self.model_config.cycle_prev();
-        self.redraw();
+        self.request_redraw(true);
     }
 
     fn mark_model_unavailable(&mut self) {
         self.model_config.mark_unavailable();
-        self.redraw();
+        self.request_redraw(true);
     }
 
     fn max_log_scroll(&self) -> usize {
@@ -798,30 +854,34 @@ impl LogSink for TuiLogSink {
         };
         self.agent_status = "Initializing".to_string();
         self.usage_status = UsageTracker::new(&options.executor).initial_status();
-        self.configure_model_options(&options.executor, options.model.as_deref());
-        self.redraw();
+        self.configure_model_options(
+            &options.executor,
+            options.model.as_deref(),
+            options.refresh_model_cache,
+        );
+        self.request_redraw(true);
     }
 
     fn on_line(&mut self, stream: LogStream, line: &str) {
         let kind = classify_tui_line(stream, line);
         self.push_log_entry(kind, normalize_tui_line_text(kind, line));
         self.status = "running".to_string();
-        self.redraw();
+        self.request_redraw(false);
     }
 
     fn on_status(&mut self, message: &str) {
         self.status = message.to_string();
-        self.redraw();
+        self.request_redraw(false);
     }
 
     fn on_agent_status(&mut self, message: &str) {
         self.agent_status = message.to_string();
-        self.redraw();
+        self.request_redraw(false);
     }
 
     fn on_usage_status(&mut self, message: &str) {
         self.usage_status = message.to_string();
-        self.redraw();
+        self.request_redraw(false);
     }
 
     fn on_model_unavailable(&mut self) {
@@ -835,7 +895,13 @@ impl LogSink for TuiLogSink {
         } else {
             self.agent_status = "Error".to_string();
         }
-        self.redraw();
+        self.request_redraw(true);
+    }
+
+    fn flush(&mut self) {
+        if self.pending_redraw && self.last_redraw.elapsed() >= self.redraw_interval {
+            self.request_redraw(true);
+        }
     }
 
     fn on_key_event(&mut self, key: KeyEvent) {
@@ -961,6 +1027,8 @@ struct RunCliArgs {
     session_id: Option<String>,
     #[arg(long = "resume-latest")]
     resume_latest: bool,
+    #[arg(long = "refresh-model-cache")]
+    refresh_model_cache: bool,
     #[arg(long)]
     review: bool,
     #[arg(long = "var", value_name = "KEY=VALUE")]
@@ -985,6 +1053,8 @@ struct RunCliArgs {
     auto_approve: Option<bool>,
     #[arg(long = "allow-all-tools")]
     allow_all_tools: bool,
+    #[arg(long = "executor-path", value_name = "NAME=PATH")]
+    executor_paths: Vec<String>,
     #[arg(long = "no-tui")]
     no_tui: bool,
 }
@@ -1003,6 +1073,62 @@ fn executor_kind_from_arg(value: ExecutorArg) -> ExecutorKind {
         ExecutorArg::Copilot => ExecutorKind::Copilot,
         ExecutorArg::Custom => ExecutorKind::Custom("custom".to_string()),
     }
+}
+
+fn normalize_executor_key(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some("codex".to_string()),
+        "claude" => Some("claude".to_string()),
+        "cursor-agent" | "cursor" => Some("cursor-agent".to_string()),
+        "droid" => Some("droid".to_string()),
+        "amp" => Some("amp".to_string()),
+        "gemini" => Some("gemini".to_string()),
+        "opencode" => Some("opencode".to_string()),
+        "local" => Some("local".to_string()),
+        "qwen-code" | "qwen" => Some("qwen-code".to_string()),
+        "copilot" => Some("copilot".to_string()),
+        "custom" => Some("custom".to_string()),
+        _ => None,
+    }
+}
+
+fn executor_key_for_kind(kind: &ExecutorKind) -> Option<&'static str> {
+    match kind {
+        ExecutorKind::Codex => Some("codex"),
+        ExecutorKind::Claude => Some("claude"),
+        ExecutorKind::CursorAgent => Some("cursor-agent"),
+        ExecutorKind::Droid => Some("droid"),
+        ExecutorKind::Amp => Some("amp"),
+        ExecutorKind::Gemini => Some("gemini"),
+        ExecutorKind::Opencode => Some("opencode"),
+        ExecutorKind::Local => Some("local"),
+        ExecutorKind::QwenCode => Some("qwen-code"),
+        ExecutorKind::Copilot => Some("copilot"),
+        ExecutorKind::Custom(_) => Some("custom"),
+    }
+}
+
+fn parse_executor_path_arg(raw: &str) -> Result<(String, String), CliError> {
+    let mut parts = raw.splitn(2, '=');
+    let name = parts.next().unwrap_or("").trim();
+    let path = parts.next().unwrap_or("").trim();
+    if name.is_empty() || path.is_empty() {
+        return Err(CliError::Arg(
+            "--executor-path expects NAME=PATH".to_string(),
+        ));
+    }
+    let normalized = normalize_executor_key(name).ok_or_else(|| {
+        CliError::Arg(format!("unsupported executor for --executor-path: {name}"))
+    })?;
+    Ok((normalized, path.to_string()))
+}
+
+fn executor_path_override(
+    kind: &ExecutorKind,
+    overrides: &HashMap<String, String>,
+) -> Option<String> {
+    let key = executor_key_for_kind(kind)?;
+    overrides.get(key).cloned()
 }
 
 fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions, CliError> {
@@ -1030,6 +1156,19 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
         })?;
     }
 
+    let mut executor_paths = load_executor_path_cache().entries;
+    let mut executor_paths_updated = false;
+    for raw in args.executor_paths {
+        let (name, path) = parse_executor_path_arg(&raw)?;
+        executor_paths.insert(name, path);
+        executor_paths_updated = true;
+    }
+    if executor_paths_updated {
+        save_executor_path_cache(&ExecutorPathCache {
+            entries: executor_paths.clone(),
+        });
+    }
+
     Ok(RunOptions {
         executor: executor_kind_from_arg(args.executor),
         prompt: args.prompt,
@@ -1038,6 +1177,7 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         session_id,
         resume: args.resume_latest || session_id.is_some(),
+        refresh_model_cache: args.refresh_model_cache,
         review: args.review,
         env_vars,
         base_command_override: args.base_command_override,
@@ -1050,6 +1190,7 @@ fn convert_run_cli_args(args: RunCliArgs, force_tui: bool) -> Result<RunOptions,
         trust: args.trust,
         auto_approve: args.auto_approve.unwrap_or(true),
         allow_all_tools: args.allow_all_tools,
+        executor_paths,
         tui: if force_tui { true } else { !args.no_tui },
     })
 }
@@ -1092,7 +1233,7 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, CliError> {
     }
 }
 
-fn model_options_for_executor(executor: &ExecutorKind) -> Vec<String> {
+fn model_options_for_executor(executor: &ExecutorKind, refresh_local_cache: bool) -> Vec<String> {
     match executor {
         ExecutorKind::Codex => vec![
             "gpt-5".to_string(),
@@ -1120,7 +1261,7 @@ fn model_options_for_executor(executor: &ExecutorKind) -> Vec<String> {
             "claude-sonnet-4-5".to_string(),
             "gemini-2.5-pro".to_string(),
         ],
-        ExecutorKind::Local => discover_local_model_options(),
+        ExecutorKind::Local => discover_local_model_options(refresh_local_cache),
         ExecutorKind::QwenCode => vec!["qwen3-coder-plus".to_string(), "qwen3-coder".to_string()],
         ExecutorKind::Copilot => vec![
             "gpt-4.1".to_string(),
@@ -1132,7 +1273,13 @@ fn model_options_for_executor(executor: &ExecutorKind) -> Vec<String> {
     }
 }
 
-fn discover_local_model_options() -> Vec<String> {
+fn discover_local_model_options(refresh_cache: bool) -> Vec<String> {
+    if !refresh_cache {
+        if let Some(cached) = load_model_cache() {
+            return cached;
+        }
+    }
+
     let mut options = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1148,6 +1295,10 @@ fn discover_local_model_options() -> Vec<String> {
         if seen.insert(value.clone()) {
             options.push(value);
         }
+    }
+
+    if !options.is_empty() {
+        write_model_cache(&options);
     }
 
     options
@@ -1570,11 +1721,81 @@ fn session_metadata_path(session_id: &str) -> PathBuf {
     session_metadata_dir().join(format!("{session_id}.json"))
 }
 
+fn cache_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".aura").join("cache")
+}
+
+fn model_cache_path() -> PathBuf {
+    cache_dir().join("models.json")
+}
+
+fn executor_path_cache_path() -> PathBuf {
+    cache_dir().join("executors.json")
+}
+
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn load_model_cache() -> Option<Vec<String>> {
+    let path = model_cache_path();
+    let Ok(raw) = fs::read_to_string(path) else {
+        return None;
+    };
+    let Ok(cache) = serde_json::from_str::<ModelCache>(&raw) else {
+        return None;
+    };
+    if cache.version != 1 {
+        return None;
+    }
+    let age = now_epoch_secs().saturating_sub(cache.updated_at);
+    if age > 86_400 {
+        return None;
+    }
+    if cache.models.is_empty() {
+        return None;
+    }
+    Some(cache.models)
+}
+
+fn write_model_cache(models: &[String]) {
+    let path = model_cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let cache = ModelCache {
+        version: 1,
+        updated_at: now_epoch_secs(),
+        models: models.to_vec(),
+        sources: vec!["ollama".to_string(), "lmstudio".to_string()],
+    };
+    if let Ok(serialized) = serde_json::to_string(&cache) {
+        let _ = fs::write(path, serialized);
+    }
+}
+
+fn load_executor_path_cache() -> ExecutorPathCache {
+    let path = executor_path_cache_path();
+    let Ok(raw) = fs::read_to_string(path) else {
+        return ExecutorPathCache::default();
+    };
+    serde_json::from_str::<ExecutorPathCache>(&raw).unwrap_or_default()
+}
+
+fn save_executor_path_cache(cache: &ExecutorPathCache) {
+    let path = executor_path_cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(serialized) = serde_json::to_string(cache) {
+        let _ = fs::write(path, serialized);
+    }
 }
 
 fn write_session_metadata(context: &SessionContext, thread_id: Option<String>) {
@@ -1598,6 +1819,13 @@ fn write_session_metadata(context: &SessionContext, thread_id: Option<String>) {
     if let Ok(serialized) = serde_json::to_string(&metadata) {
         let _ = fs::write(path, serialized);
     }
+    upsert_session_index(SessionIndexEntry {
+        session_id: metadata.session_id.clone(),
+        executor: metadata.executor.clone(),
+        cwd: metadata.cwd.clone(),
+        created_at: metadata.created_at,
+        thread_id: metadata.thread_id.clone(),
+    });
 }
 
 fn update_session_thread_id(context: &SessionContext, thread_id: &str) {
@@ -1628,6 +1856,55 @@ fn update_session_thread_id(context: &SessionContext, thread_id: &str) {
     if let Ok(serialized) = serde_json::to_string(&updated) {
         let _ = fs::write(path, serialized);
     }
+    upsert_session_index(SessionIndexEntry {
+        session_id: updated.session_id.clone(),
+        executor: updated.executor.clone(),
+        cwd: updated.cwd.clone(),
+        created_at: updated.created_at,
+        thread_id: updated.thread_id.clone(),
+    });
+}
+
+fn session_index_path() -> PathBuf {
+    session_metadata_dir().join("index.json")
+}
+
+fn read_session_index_entries() -> Option<Vec<SessionIndexEntry>> {
+    let path = session_index_path();
+    let Ok(raw) = fs::read_to_string(path) else {
+        return None;
+    };
+    serde_json::from_str::<Vec<SessionIndexEntry>>(&raw).ok()
+}
+
+fn write_session_index_entries(entries: &[SessionIndexEntry]) {
+    let path = session_index_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(serialized) = serde_json::to_string(entries) {
+        let _ = fs::write(path, serialized);
+    }
+}
+
+fn upsert_session_index(entry: SessionIndexEntry) {
+    let mut entries = read_session_index_entries().unwrap_or_default();
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|existing| existing.session_id == entry.session_id)
+    {
+        existing.executor = entry.executor;
+        existing.cwd = entry.cwd;
+        if existing.created_at == 0 {
+            existing.created_at = entry.created_at;
+        }
+        if entry.thread_id.is_some() {
+            existing.thread_id = entry.thread_id;
+        }
+    } else {
+        entries.push(entry);
+    }
+    write_session_index_entries(&entries);
 }
 
 fn read_session_metadata_entries() -> Vec<SessionMetadata> {
@@ -1653,15 +1930,30 @@ fn read_session_metadata_entries() -> Vec<SessionMetadata> {
     out
 }
 
+fn read_session_entries_from_index_or_disk() -> Vec<SessionMetadata> {
+    if let Some(entries) = read_session_index_entries() {
+        if !entries.is_empty() {
+            return entries
+                .into_iter()
+                .map(|entry| SessionMetadata {
+                    session_id: entry.session_id,
+                    executor: entry.executor,
+                    cwd: entry.cwd,
+                    created_at: entry.created_at,
+                    thread_id: entry.thread_id,
+                })
+                .collect();
+        }
+    }
+    read_session_metadata_entries()
+}
+
 fn select_latest_session(entries: &[SessionMetadata]) -> Option<SessionMetadata> {
-    entries
-        .iter()
-        .max_by_key(|entry| entry.created_at)
-        .cloned()
+    entries.iter().max_by_key(|entry| entry.created_at).cloned()
 }
 
 fn latest_session_id() -> Option<String> {
-    let entries = read_session_metadata_entries();
+    let entries = read_session_entries_from_index_or_disk();
     select_latest_session(&entries).map(|entry| entry.session_id)
 }
 
@@ -1673,7 +1965,7 @@ fn session_cwd_matches(entry_cwd: &str, filter_cwd: &PathBuf) -> bool {
 }
 
 pub fn list_sessions(args: SessionListArgs) -> String {
-    let mut entries = read_session_metadata_entries();
+    let mut entries = read_session_entries_from_index_or_disk();
     if let Some(executor) = args.executor {
         let executor_kind = executor_kind_from_arg(executor);
         entries.retain(|entry| entry.executor == executor_kind);
@@ -1719,7 +2011,8 @@ pub fn show_session(session_id: &str) -> Result<String, CliError> {
         metadata.executor,
         metadata.created_at,
         metadata.cwd,
-        metadata.thread_id
+        metadata
+            .thread_id
             .clone()
             .unwrap_or_else(|| "n/a".to_string())
     ))
@@ -1825,7 +2118,7 @@ fn ensure_local_model_selected(options: &mut RunOptions) -> Result<(), CliError>
         return Ok(());
     }
 
-    let models = discover_local_model_options();
+    let models = discover_local_model_options(options.refresh_model_cache);
     if models.is_empty() {
         return Err(CliError::Arg(
             "no local models discovered from Ollama or LM Studio; pass --model explicitly"
@@ -1909,14 +2202,11 @@ async fn run_executor_inner(
         env.insert("AURA_SESSION_ID", session_id.clone());
     }
 
-    let session_context = options
-        .session_id
-        .clone()
-        .map(|session_id| SessionContext {
-            session_id,
-            executor: options.executor.clone(),
-            cwd: options.cwd.clone(),
-        });
+    let session_context = options.session_id.clone().map(|session_id| SessionContext {
+        session_id,
+        executor: options.executor.clone(),
+        cwd: options.cwd.clone(),
+    });
     if let Some(context) = &session_context {
         write_session_metadata(context, None);
         sink.on_status(&format!(
@@ -1968,8 +2258,12 @@ async fn run_executor_inner(
 }
 
 fn build_executor(options: &RunOptions) -> Box<dyn StandardCodingAgentExecutor> {
+    let executor_override = executor_path_override(&options.executor, &options.executor_paths);
     let cmd_overrides = CmdOverrides {
-        base_command_override: options.base_command_override.clone(),
+        base_command_override: options
+            .base_command_override
+            .clone()
+            .or(executor_override),
         additional_params: if options.additional_params.is_empty() {
             None
         } else {
@@ -2555,12 +2849,14 @@ pub async fn stream_spawned(
                     sink.on_status("waiting for subprocess output...");
                     last_wait_status_at = Instant::now();
                 }
+                sink.flush();
                 continue;
             }
         }) else {
             if got_exit_status && streams_closed >= expected_streams {
                 break;
             }
+            sink.flush();
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
@@ -2598,6 +2894,8 @@ pub async fn stream_spawned(
         if got_exit_status && streams_closed >= expected_streams {
             break;
         }
+
+        sink.flush();
     }
 
     if formatter.suppressed_codex_rollout_warnings > 0 {
@@ -3310,6 +3608,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             cwd: PathBuf::from("."),
             session_id: None,
             resume: false,
+            refresh_model_cache: false,
             review: false,
             env_vars: HashMap::new(),
             base_command_override: Some("sh".to_string()),
@@ -3325,6 +3624,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             trust: false,
             auto_approve: true,
             allow_all_tools: false,
+            executor_paths: HashMap::new(),
             tui: false,
         };
 
@@ -3344,6 +3644,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             cwd: PathBuf::from("."),
             session_id: Some("session-xyz".to_string()),
             resume: true,
+            refresh_model_cache: false,
             review: false,
             env_vars: HashMap::new(),
             base_command_override: Some("sh".to_string()),
@@ -3359,6 +3660,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             trust: false,
             auto_approve: true,
             allow_all_tools: false,
+            executor_paths: HashMap::new(),
             tui: false,
         };
 
@@ -3376,6 +3678,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             cwd: PathBuf::from("."),
             session_id: None,
             resume: false,
+            refresh_model_cache: false,
             review: false,
             env_vars: HashMap::new(),
             base_command_override: Some("echo".to_string()),
@@ -3388,6 +3691,7 @@ qwen2.5-coder:7b      fedcba          4.1 GB    1 day ago
             trust: false,
             auto_approve: true,
             allow_all_tools: false,
+            executor_paths: HashMap::new(),
             tui: false,
         };
 

@@ -26,15 +26,13 @@ async fn main() {
         CliCommand::SessionList(args) => {
             println!("{}", list_sessions(args));
         }
-        CliCommand::SessionShow { session_id } => {
-            match show_session(&session_id) {
-                Ok(output) => println!("{output}"),
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    std::process::exit(1);
-                }
+        CliCommand::SessionShow { session_id } => match show_session(&session_id) {
+            Ok(output) => println!("{output}"),
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(1);
             }
-        }
+        },
         CliCommand::SessionLatest => match latest_session() {
             Ok(session_id) => println!("{session_id}"),
             Err(err) => {
