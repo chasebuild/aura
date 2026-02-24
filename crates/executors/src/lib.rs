@@ -730,7 +730,6 @@ mod tests {
             append_prompt: AppendPrompt::default(),
             model: None,
             sandbox: None,
-            ask_for_approval: None,
             cmd_overrides: CmdOverrides {
                 base_command_override: Some("echo".to_string()),
                 additional_params: None,

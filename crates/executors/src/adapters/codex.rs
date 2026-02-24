@@ -10,7 +10,6 @@ pub struct CodexOptions {
     pub append_prompt: AppendPrompt,
     pub model: Option<String>,
     pub sandbox: Option<String>,
-    pub ask_for_approval: Option<String>,
     pub cmd_overrides: CmdOverrides,
 }
 
@@ -25,9 +24,6 @@ pub fn codex(options: CodexOptions) -> CommandBackedExecutor {
     }
     if let Some(sandbox) = options.sandbox {
         params.extend(["--sandbox".to_string(), sandbox]);
-    }
-    if let Some(policy) = options.ask_for_approval {
-        params.extend(["--ask-for-approval".to_string(), policy]);
     }
 
     CommandBackedExecutor::new(CommandExecutorConfig {
