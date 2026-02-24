@@ -2999,6 +2999,18 @@ impl LogFormatter {
         line.contains("failed to refresh available models")
             && line.contains("timeout waiting for child process to exit")
     }
+
+    fn on_process_started(&mut self, pid: u32) -> Option<String> {
+        self.usage_tracker.on_process_started(pid)
+    }
+
+    fn on_usage_tick(&mut self) -> Option<String> {
+        self.usage_tracker.on_tick()
+    }
+
+    fn on_process_finished(&mut self) -> Option<String> {
+        self.usage_tracker.final_status()
+    }
 }
 
 fn summarize_text(text: &str, max_len: usize) -> String {
@@ -3052,6 +3064,11 @@ pub(crate) async fn stream_spawned(
     let mut exit_code: Option<i32> = None;
     let mut got_exit_status = false;
     let mut formatter = LogFormatter::new(executor_kind, local_provider);
+    if let Some(pid) = child.id()
+        && let Some(status) = formatter.on_process_started(pid)
+    {
+        sink.on_usage_status(&status);
+    }
     let mut last_wait_status_at = Instant::now();
     let mut quit_requested_at: Option<Instant> = None;
     let mut user_requested_exit = false;
@@ -3100,12 +3117,18 @@ pub(crate) async fn stream_spawned(
                     sink.on_status("waiting for subprocess output...");
                     last_wait_status_at = Instant::now();
                 }
+                if let Some(status) = formatter.on_usage_tick() {
+                    sink.on_usage_status(&status);
+                }
                 sink.flush();
                 continue;
             }
         }) else {
             if got_exit_status && streams_closed >= expected_streams {
                 break;
+            }
+            if let Some(status) = formatter.on_usage_tick() {
+                sink.on_usage_status(&status);
             }
             sink.flush();
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3149,6 +3172,9 @@ pub(crate) async fn stream_spawned(
             break;
         }
 
+        if let Some(status) = formatter.on_usage_tick() {
+            sink.on_usage_status(&status);
+        }
         sink.flush();
     }
 
@@ -3157,6 +3183,9 @@ pub(crate) async fn stream_spawned(
             "suppressed {} repeated codex rollout-path warnings",
             formatter.suppressed_codex_rollout_warnings
         ));
+    }
+    if let Some(status) = formatter.on_process_finished() {
+        sink.on_usage_status(&status);
     }
 
     sink.on_exit(exit_code);

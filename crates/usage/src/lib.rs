@@ -5,39 +5,76 @@ use fuelcheck_core::reports::{
     types::SessionReportRow, types::split_usage_tokens,
 };
 use serde_json::Value;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 pub struct UsageTracker {
+    base_status: String,
     inner: UsageTrackerImpl,
+    resources: ResourceTracker,
 }
 
 enum UsageTrackerImpl {
     Codex(CodexUsageTracker),
-    Unsupported(UnsupportedUsageTracker),
+    Unsupported,
 }
 
 impl UsageTracker {
     pub fn new(executor: &ExecutorKind) -> Self {
+        let base_status = match executor {
+            ExecutorKind::Codex => "collecting usage...".to_string(),
+            _ => format!("{}: n/a", executor_display_name(executor)),
+        };
         let inner = match executor {
             ExecutorKind::Codex => UsageTrackerImpl::Codex(CodexUsageTracker::default()),
-            _ => UsageTrackerImpl::Unsupported(UnsupportedUsageTracker {
-                executor_label: executor_display_name(executor),
-            }),
+            _ => UsageTrackerImpl::Unsupported,
         };
-        Self { inner }
+        Self {
+            base_status,
+            inner,
+            resources: ResourceTracker::default(),
+        }
     }
 
     pub fn initial_status(&self) -> String {
-        match &self.inner {
-            UsageTrackerImpl::Codex(_) => "collecting usage...".to_string(),
-            UsageTrackerImpl::Unsupported(tracker) => format!("{}: n/a", tracker.executor_label),
+        self.compose_status()
+    }
+
+    pub fn on_process_started(&mut self, pid: u32) -> Option<String> {
+        self.resources.attach_process(pid);
+        self.resources.sample_if_due(true);
+        Some(self.compose_status())
+    }
+
+    pub fn on_tick(&mut self) -> Option<String> {
+        if self.resources.sample_if_due(false) {
+            return Some(self.compose_status());
         }
+        None
+    }
+
+    pub fn final_status(&mut self) -> Option<String> {
+        self.resources.sample_if_due(true);
+        self.resources
+            .summary_text()
+            .map(|summary| format!("{} | {summary}", self.base_status))
     }
 
     pub fn on_event(&mut self, event_type: &str, value: &Value) -> Option<String> {
-        match &mut self.inner {
+        let updated = match &mut self.inner {
             UsageTrackerImpl::Codex(tracker) => tracker.on_event(event_type, value),
-            UsageTrackerImpl::Unsupported(_) => None,
+            UsageTrackerImpl::Unsupported => None,
+        };
+        if let Some(status) = updated {
+            self.base_status = status;
+            self.resources.sample_if_due(false);
+            return Some(self.compose_status());
         }
+        None
+    }
+
+    fn compose_status(&self) -> String {
+        format!("{} | {}", self.base_status, self.resources.live_text())
     }
 }
 
@@ -84,8 +121,181 @@ impl CodexUsageTracker {
     }
 }
 
-struct UnsupportedUsageTracker {
-    executor_label: String,
+#[derive(Default)]
+struct ResourceTracker {
+    pid: Option<u32>,
+    last_sample_at: Option<Instant>,
+    last_gpu_sample_at: Option<Instant>,
+    last_snapshot: ResourceSnapshot,
+    stats: ResourceStats,
+}
+
+#[derive(Default, Clone, Copy)]
+struct ResourceSnapshot {
+    cpu_percent: Option<f32>,
+    gpu_percent: Option<f32>,
+    rss_kb: Option<u64>,
+}
+
+#[derive(Default)]
+struct ResourceStats {
+    cpu_sum: f64,
+    cpu_count: u64,
+    cpu_peak: f32,
+    gpu_sum: f64,
+    gpu_count: u64,
+    gpu_peak: f32,
+    rss_peak_kb: u64,
+}
+
+impl ResourceTracker {
+    fn attach_process(&mut self, pid: u32) {
+        self.pid = Some(pid);
+    }
+
+    fn sample_if_due(&mut self, force: bool) -> bool {
+        let Some(pid) = self.pid else {
+            return false;
+        };
+        let now = Instant::now();
+        let due = force
+            || self
+                .last_sample_at
+                .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(1));
+        if !due {
+            return false;
+        }
+
+        let mut updated = false;
+        if let Some((cpu_percent, rss_kb)) = sample_process_cpu_rss(pid) {
+            self.last_snapshot.cpu_percent = Some(cpu_percent);
+            self.last_snapshot.rss_kb = Some(rss_kb);
+            self.stats.cpu_sum += f64::from(cpu_percent);
+            self.stats.cpu_count += 1;
+            self.stats.cpu_peak = self.stats.cpu_peak.max(cpu_percent);
+            self.stats.rss_peak_kb = self.stats.rss_peak_kb.max(rss_kb);
+            updated = true;
+        }
+
+        let gpu_due = force
+            || self
+                .last_gpu_sample_at
+                .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(3));
+        if gpu_due {
+            if let Some(gpu_percent) = sample_gpu_percent() {
+                self.last_snapshot.gpu_percent = Some(gpu_percent);
+                self.stats.gpu_sum += f64::from(gpu_percent);
+                self.stats.gpu_count += 1;
+                self.stats.gpu_peak = self.stats.gpu_peak.max(gpu_percent);
+                updated = true;
+            }
+            self.last_gpu_sample_at = Some(now);
+        }
+
+        self.last_sample_at = Some(now);
+        updated
+    }
+
+    fn live_text(&self) -> String {
+        let cpu = self
+            .last_snapshot
+            .cpu_percent
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "--".to_string());
+        let gpu = self
+            .last_snapshot
+            .gpu_percent
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "--".to_string());
+        let mem = self
+            .last_snapshot
+            .rss_kb
+            .map(format_kib_as_mib)
+            .unwrap_or_else(|| "--".to_string());
+        format!("cpu={cpu} gpu={gpu} mem={mem}")
+    }
+
+    fn summary_text(&self) -> Option<String> {
+        if self.stats.cpu_count == 0 && self.stats.gpu_count == 0 && self.stats.rss_peak_kb == 0 {
+            return None;
+        }
+        let cpu_avg = if self.stats.cpu_count > 0 {
+            self.stats.cpu_sum / self.stats.cpu_count as f64
+        } else {
+            0.0
+        };
+        let gpu_avg = if self.stats.gpu_count > 0 {
+            self.stats.gpu_sum / self.stats.gpu_count as f64
+        } else {
+            0.0
+        };
+        Some(format!(
+            "resource: cpu avg/peak={cpu_avg:.1}%/{:.1}% | gpu avg/peak={gpu_avg:.1}%/{:.1}% | mem peak={}",
+            self.stats.cpu_peak,
+            self.stats.gpu_peak,
+            format_kib_as_mib(self.stats.rss_peak_kb)
+        ))
+    }
+}
+
+fn sample_process_cpu_rss(pid: u32) -> Option<(f32, u64)> {
+    let output = Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("%cpu=")
+        .arg("-o")
+        .arg("rss=")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.split_whitespace();
+    let cpu = parts.next()?.parse::<f32>().ok()?;
+    let rss_kb = parts.next()?.parse::<u64>().ok()?;
+    Some((cpu, rss_kb))
+}
+
+fn sample_gpu_percent() -> Option<f32> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("ioreg")
+            .arg("-r")
+            .arg("-d")
+            .arg("1")
+            .arg("-c")
+            .arg("AGXAccelerator")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            if !line.contains("Device Utilization %") {
+                continue;
+            }
+            let digits: String = line
+                .chars()
+                .skip_while(|ch| !ch.is_ascii_digit())
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect();
+            if let Ok(value) = digits.parse::<f32>() {
+                return Some(value.min(100.0));
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+fn format_kib_as_mib(kib: u64) -> String {
+    format!("{:.0}MiB", kib as f64 / 1024.0)
 }
 
 fn build_codex_usage_status(
@@ -263,7 +473,11 @@ mod tests {
     #[test]
     fn unsupported_executor_reports_na() {
         let tracker = UsageTracker::new(&ExecutorKind::Claude);
-        assert_eq!(tracker.initial_status(), "claude: n/a");
+        let status = tracker.initial_status();
+        assert!(status.contains("claude: n/a"));
+        assert!(status.contains("cpu="));
+        assert!(status.contains("gpu="));
+        assert!(status.contains("mem="));
     }
 
     #[test]
