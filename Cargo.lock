@@ -110,7 +110,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aura-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aura-contracts",
  "aura-executors",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "aura-contracts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "indexmap",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "aura-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aura-contracts",
@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "aura-executors"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aura-contracts",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "aura-git"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "git2",
  "serde",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "aura-notify-contracts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "aura-orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aura-contracts",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "aura-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "aura-contracts",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "aura-usage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aura-contracts",
  "chrono",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "aura-worker-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aura-contracts",
  "chrono",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "aura-workspace"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aura-git",
  "tempfile",
