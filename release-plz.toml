@@ -1,0 +1,15 @@
+[workspace]
+repo_url = "https://github.com/chasebuild/aura"
+release_always = false
+semver_check = false
+changelog_update = false
+git_release_enable = false
+git_tag_name = "{{ package }}-v{{ version }}"
+pr_labels = ["release"]
+publish_timeout = "10m"
+
+[[package]]
+name = "aura-cli"
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+git_release_enable = true

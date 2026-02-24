@@ -131,3 +131,32 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+## Release CLI
+
+Use `release-plz` for workspace versioning, changelog updates, and publish orchestration.
+The repo provides npm wrappers so the flow stays one command.
+
+Install once:
+
+```bash
+cargo install release-plz
+```
+
+Update versions/changelog locally from conventional commits:
+
+```bash
+npm run changelog -- --dry-run
+```
+
+Open or refresh the release PR:
+
+```bash
+npm run release:pr -- --dry-run
+```
+
+Publish crates:
+
+```bash
+npm run release:publish -- --dry-run
+```

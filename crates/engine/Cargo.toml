@@ -1,16 +1,24 @@
 [package]
 name = "aura-engine"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+description = "Deterministic orchestration state machine for AURA."
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aura-engine"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-aura-contracts = { path = "../contracts" }
-aura-executors = { path = "../executors" }
-aura-git = { path = "../git" }
-aura-store = { path = "../store" }
-aura-worker-protocol = { path = "../worker-protocol" }
+aura-contracts.workspace = true
+aura-executors.workspace = true
+aura-git.workspace = true
+aura-store.workspace = true
+aura-worker-protocol.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 regex.workspace = true

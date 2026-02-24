@@ -13,11 +13,27 @@ members = [
 ]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
+authors = ["AURA Contributors"]
+repository = "https://github.com/chasebuild/aura"
+homepage = "https://github.com/chasebuild/aura"
+readme = "README.md"
+keywords = ["ai", "agent", "orchestration", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
+aura-contracts = { version = "0.1.0", path = "crates/contracts" }
+aura-store = { version = "0.1.0", path = "crates/store" }
+aura-git = { version = "0.1.0", path = "crates/git" }
+aura-workspace = { version = "0.1.0", path = "crates/workspace" }
+aura-executors = { version = "0.1.0", path = "crates/executors" }
+aura-worker-protocol = { version = "0.1.0", path = "crates/worker-protocol" }
+aura-engine = { version = "0.1.0", path = "crates/engine" }
+aura-usage = { version = "0.1.0", path = "crates/usage" }
+aura-cli = { version = "0.1.0", path = "crates/cli" }
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

@@ -1,12 +1,20 @@
 [package]
 name = "aura-usage"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+description = "Token usage and cost tracking for AURA runs."
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aura-usage"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-aura-contracts = { path = "../contracts" }
+aura-contracts.workspace = true
 chrono.workspace = true
 fuelcheck-core = { version = "0.1.0" }
 serde_json.workspace = true

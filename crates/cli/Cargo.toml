@@ -1,18 +1,26 @@
 [package]
 name = "aura-cli"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+description = "Command-line interface and TUI for running AURA executors."
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aura-cli"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "aura"
 path = "src/main.rs"
 
 [dependencies]
-aura-contracts = { path = "../contracts" }
-aura-executors = { path = "../executors" }
-aura-usage = { path = "../usage" }
+aura-contracts.workspace = true
+aura-executors.workspace = true
+aura-usage.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 cliclack = "0.3"

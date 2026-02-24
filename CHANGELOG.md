@@ -11,6 +11,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Updated project documentation across `README.md`, `CONTRIBUTING.md`, and `CHANGELOG.md`.
 - Added a Rust-native `local` executor with local model discovery from Ollama and LM Studio, configurable OpenAI-compatible endpoint support, and interactive model selection when `--model` is omitted.
 - Migrated CLI argument parsing to `clap`, added completion generation with `clap_complete`, upgraded local model selection prompt UX with `cliclack`, and switched local discovery subprocesses to `duct`.
+- Centralized crate publish metadata/versioning in workspace manifests and integrated `release-plz` for automated release PR + publish flow.
 
 ## [0.1.0] - 2026-02-23
 

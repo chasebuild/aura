@@ -1,0 +1,13 @@
+{
+  "name": "aura-release-tools",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "changelog": "./scripts/changelog.mjs"
+  },
+  "scripts": {
+    "changelog": "node ./scripts/changelog.mjs",
+    "release:pr": "node ./scripts/changelog.mjs release-pr",
+    "release:publish": "node ./scripts/changelog.mjs release"
+  }
+}

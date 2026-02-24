@@ -49,6 +49,35 @@ cargo test --workspace
 
 If behavior changes, add or update tests in the relevant crate.
 
+## Version Bumps and Release
+
+Use `release-plz` for version bumps and crate publication.
+The npm scripts are thin wrappers around `release-plz`.
+
+Install once:
+
+```bash
+cargo install release-plz
+```
+
+Update versions/changelog locally:
+
+```bash
+npm run changelog -- --dry-run
+```
+
+Open or refresh release PR:
+
+```bash
+npm run release:pr -- --dry-run
+```
+
+Publish crates:
+
+```bash
+npm run release:publish -- --dry-run
+```
+
 ## Project Layout
 
 - `/crates/contracts`: shared domain and state models

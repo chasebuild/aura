@@ -1,16 +1,24 @@
 [package]
 name = "aura-store"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+description = "Storage backends and store abstractions for AURA sessions."
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aura-store"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = []
 sqlite = ["dep:sqlx"]
 
 [dependencies]
-aura-contracts = { path = "../contracts" }
+aura-contracts.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true
