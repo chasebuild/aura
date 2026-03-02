@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/chasebuild/aura/releases/tag/aura-cli-v0.2.0) - 2026-03-02
+
+### Added
+
+- *(cli)* add mission control board for running agents
+
 ### Added
 
 - Added `aura-orchestrator` crate with a composable supervisor runtime:
