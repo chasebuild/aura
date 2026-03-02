@@ -353,6 +353,11 @@ pub(crate) async fn stream_spawned(
     {
         sink.on_usage_status(&status);
     }
+    if let Some(context) = &session_context
+        && let Some(pid) = child.id()
+    {
+        session_store::write_runtime_started(context, pid);
+    }
     let mut last_wait_status_at = Instant::now();
     let mut quit_requested_at: Option<Instant> = None;
     let mut user_requested_exit = false;
@@ -435,8 +440,18 @@ pub(crate) async fn stream_spawned(
                 for display in formatter.format(stream, &line) {
                     match display {
                         DisplayEvent::Line(stream, line) => sink.on_line(stream, &line),
-                        DisplayEvent::Status(status) => sink.on_status(&status),
-                        DisplayEvent::AgentStatus(status) => sink.on_agent_status(&status),
+                        DisplayEvent::Status(status) => {
+                            sink.on_status(&status);
+                            if let Some(context) = &session_context {
+                                session_store::update_runtime_status(context, Some(&status), None);
+                            }
+                        }
+                        DisplayEvent::AgentStatus(status) => {
+                            sink.on_agent_status(&status);
+                            if let Some(context) = &session_context {
+                                session_store::update_runtime_status(context, None, Some(&status));
+                            }
+                        }
                         DisplayEvent::UsageStatus(status) => sink.on_usage_status(&status),
                         DisplayEvent::ModelUnavailable => sink.on_model_unavailable(),
                         DisplayEvent::SessionThreadId(thread_id) => {
@@ -481,6 +496,9 @@ pub(crate) async fn stream_spawned(
     }
     if let Some(status) = formatter.on_process_finished() {
         sink.on_usage_status(&status);
+    }
+    if let Some(context) = &session_context {
+        session_store::write_runtime_finished(context, exit_code);
     }
 
     sink.on_exit(exit_code);

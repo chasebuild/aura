@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+mod board;
 mod local_exec;
 mod runtime;
 mod session_store;
@@ -1389,6 +1390,7 @@ impl Drop for TuiLogSink {
 #[derive(Debug, Clone)]
 pub enum CliCommand {
     Run(Box<RunOptions>),
+    Board(BoardArgs),
     SessionList(SessionListArgs),
     SessionShow { session_id: String },
     SessionLatest,
@@ -1432,12 +1434,23 @@ struct AuraCli {
 enum AuraSubcommand {
     Run(RunCliArgs),
     Tui(RunCliArgs),
+    Board(BoardArgs),
     Session(SessionCommand),
     Orchestrator(OrchestratorCommand),
     Help,
     Completion(CompletionArgs),
     #[command(name = "local-exec", hide = true)]
     LocalExec,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct BoardArgs {
+    #[arg(long = "poll-ms", default_value_t = 1000)]
+    pub(crate) poll_ms: u64,
+    #[arg(long = "no-external")]
+    pub(crate) no_external: bool,
+    #[arg(long = "show-finished", default_value_t = true, action = clap::ArgAction::Set)]
+    pub(crate) show_finished: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1856,6 +1869,7 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliCommand, CliError> {
         AuraSubcommand::Tui(run_args) => Ok(CliCommand::Run(Box::new(convert_run_cli_args(
             run_args, true,
         )?))),
+        AuraSubcommand::Board(args) => Ok(CliCommand::Board(args)),
         AuraSubcommand::Session(session) => match session.command {
             SessionArgs::List(args) => Ok(CliCommand::SessionList(args)),
             SessionArgs::Show(args) => Ok(CliCommand::SessionShow {
@@ -2114,6 +2128,10 @@ pub async fn run_with_default_sink(options: RunOptions) -> Result<RunOutcome, Cl
         let mut sink = PlainLogSink;
         run_executor_inner(options, &mut sink, false).await
     }
+}
+
+pub fn run_board(args: BoardArgs) -> Result<(), CliError> {
+    board::run_board(args)
 }
 
 pub async fn run_executor(

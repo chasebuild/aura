@@ -11,12 +11,34 @@ struct SessionMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SessionIndexEntry {
-    session_id: String,
-    executor: ExecutorKind,
-    cwd: String,
-    created_at: u64,
-    thread_id: Option<String>,
+pub(super) struct SessionIndexEntry {
+    pub session_id: String,
+    pub executor: ExecutorKind,
+    pub cwd: String,
+    pub created_at: u64,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RuntimeRunState {
+    Running,
+    Finished,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct RuntimeSessionState {
+    pub session_id: String,
+    pub executor: ExecutorKind,
+    pub cwd: String,
+    pub pid: u32,
+    pub run_state: RuntimeRunState,
+    pub started_at: u64,
+    pub updated_at: u64,
+    pub finished_at: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub last_status: Option<String>,
+    pub last_agent_status: Option<String>,
 }
 
 fn local_session_file(session_id: &str) -> PathBuf {
@@ -37,6 +59,17 @@ fn session_metadata_dir() -> PathBuf {
 
 fn session_metadata_path(session_id: &str) -> PathBuf {
     session_metadata_dir().join(format!("{session_id}.json"))
+}
+
+fn runtime_state_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".aura").join("runtime")
+}
+
+fn runtime_state_path(session_id: &str) -> PathBuf {
+    runtime_state_dir().join(format!("{session_id}.json"))
 }
 
 pub(super) fn write_session_metadata(context: &SessionContext, thread_id: Option<String>) {
@@ -104,6 +137,120 @@ pub(super) fn update_session_thread_id(context: &SessionContext, thread_id: &str
         created_at: updated.created_at,
         thread_id: updated.thread_id.clone(),
     });
+}
+
+fn write_runtime_state(state: &RuntimeSessionState) {
+    let path = runtime_state_path(&state.session_id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(serialized) = serde_json::to_string(state) {
+        let _ = fs::write(path, serialized);
+    }
+}
+
+fn read_runtime_state(session_id: &str) -> Option<RuntimeSessionState> {
+    let path = runtime_state_path(session_id);
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<RuntimeSessionState>(&raw).ok()
+}
+
+pub(super) fn write_runtime_started(context: &SessionContext, pid: u32) {
+    let now = now_epoch_secs();
+    let existing = read_runtime_state(&context.session_id);
+    let state = RuntimeSessionState {
+        session_id: context.session_id.clone(),
+        executor: context.executor.clone(),
+        cwd: context.cwd.display().to_string(),
+        pid,
+        run_state: RuntimeRunState::Running,
+        started_at: existing.as_ref().map_or(now, |entry| entry.started_at),
+        updated_at: now,
+        finished_at: None,
+        exit_code: None,
+        last_status: existing.and_then(|entry| entry.last_status),
+        last_agent_status: None,
+    };
+    write_runtime_state(&state);
+}
+
+pub(super) fn update_runtime_status(
+    context: &SessionContext,
+    status: Option<&str>,
+    agent_status: Option<&str>,
+) {
+    let mut state = read_runtime_state(&context.session_id).unwrap_or(RuntimeSessionState {
+        session_id: context.session_id.clone(),
+        executor: context.executor.clone(),
+        cwd: context.cwd.display().to_string(),
+        pid: 0,
+        run_state: RuntimeRunState::Running,
+        started_at: now_epoch_secs(),
+        updated_at: now_epoch_secs(),
+        finished_at: None,
+        exit_code: None,
+        last_status: None,
+        last_agent_status: None,
+    });
+
+    state.updated_at = now_epoch_secs();
+    if let Some(value) = status {
+        state.last_status = Some(value.to_string());
+    }
+    if let Some(value) = agent_status {
+        state.last_agent_status = Some(value.to_string());
+    }
+    write_runtime_state(&state);
+}
+
+pub(super) fn write_runtime_finished(context: &SessionContext, exit_code: Option<i32>) {
+    let mut state = read_runtime_state(&context.session_id).unwrap_or(RuntimeSessionState {
+        session_id: context.session_id.clone(),
+        executor: context.executor.clone(),
+        cwd: context.cwd.display().to_string(),
+        pid: 0,
+        run_state: RuntimeRunState::Running,
+        started_at: now_epoch_secs(),
+        updated_at: now_epoch_secs(),
+        finished_at: None,
+        exit_code: None,
+        last_status: None,
+        last_agent_status: None,
+    });
+
+    let now = now_epoch_secs();
+    state.updated_at = now;
+    state.run_state = RuntimeRunState::Finished;
+    state.finished_at = Some(now);
+    state.exit_code = exit_code;
+    write_runtime_state(&state);
+}
+
+pub(super) fn list_runtime_states() -> Vec<RuntimeSessionState> {
+    let dir = runtime_state_dir();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_str::<RuntimeSessionState>(&raw) else {
+            continue;
+        };
+        out.push(state);
+    }
+    out
+}
+
+pub(super) fn list_session_index_entries() -> Vec<SessionIndexEntry> {
+    read_session_index_entries().unwrap_or_default()
 }
 
 fn session_index_path() -> PathBuf {
